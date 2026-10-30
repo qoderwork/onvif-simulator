@@ -356,7 +356,7 @@ type Go264Config struct {
 	Mode string `json:"mode,omitempty"`
 	// LoopSeconds is the warm-up length for Mode "loop". Defaults to 5.
 	LoopSeconds int `json:"loop_seconds,omitempty"`
-	// Seed varies the synthetic pattern (colour phase and ball path) so
+	// Seed varies the synthetic pattern (color phase and ball path) so
 	// several go264 instances on one host look like different cameras.
 	Seed int `json:"seed,omitempty"`
 }
@@ -366,6 +366,21 @@ type Go264Config struct {
 const (
 	Go264ModeLive = "live"
 	Go264ModeLoop = "loop"
+)
+
+// Accepted ranges for the go264 synthetic source. The bounds mirror what the
+// pure-Go encoder will accept, so an out-of-range value fails at config load
+// instead of at stream start.
+const (
+	go264MinDimension = 16
+	go264MaxDimension = 4096
+	go264MinFPS       = 1
+	go264MaxFPS       = 120
+	go264MinQP        = 1
+	go264MaxQP        = 51
+	// maxGo264LoopSeconds caps the loop-mode warm-up cache (300 s at 30 fps
+	// is 9000 access units) so a typo cannot turn one instance into an OOM.
+	maxGo264LoopSeconds = 300
 )
 
 // HasSource reports whether the profile is configured to drive an RTSP track.
@@ -801,22 +816,11 @@ func validateProfileSource(prefix string, p *ProfileConfig) error {
 // values are valid (the runtime applies built-in defaults), so only
 // out-of-range non-zero values are rejected.
 func validateGo264(prefix string, g *Go264Config) error {
-	if g.Width != 0 && (g.Width < 16 || g.Width > 4096) {
-		return fmt.Errorf("config: %s.width: %w", prefix, ErrProfileGo264FieldRange)
+	if err := validateGo264Geometry(prefix, g); err != nil {
+		return err
 	}
-	if g.Height != 0 && (g.Height < 16 || g.Height > 4096) {
-		return fmt.Errorf("config: %s.height: %w", prefix, ErrProfileGo264FieldRange)
-	}
-	// 4:2:0 chroma requires even dimensions; go264.NewEncoder rejects odd
-	// values, so fail at config load instead of at startup.
-	if g.Width%2 != 0 || g.Height%2 != 0 {
-		return fmt.Errorf("config: %s: %w", prefix, ErrProfileGo264FieldEven)
-	}
-	if g.FPS != 0 && (g.FPS < 1 || g.FPS > 120) {
-		return fmt.Errorf("config: %s.fps: %w", prefix, ErrProfileGo264FieldRange)
-	}
-	if g.QP != 0 && (g.QP < 1 || g.QP > 51) {
-		return fmt.Errorf("config: %s.qp: %w", prefix, ErrProfileGo264FieldRange)
+	if err := validateGo264Rate(prefix, g); err != nil {
+		return err
 	}
 	if g.GOPSize < 0 {
 		return fmt.Errorf("config: %s.gop_size: %w", prefix, ErrProfileGo264FieldRange)
@@ -828,8 +832,36 @@ func validateGo264(prefix string, g *Go264Config) error {
 	}
 	// Upper bound keeps the warm-up cache bounded (300 s at 30 fps is 9000
 	// access units) so a typo cannot turn a test instance into an OOM.
-	if g.LoopSeconds < 0 || g.LoopSeconds > 300 {
+	if g.LoopSeconds < 0 || g.LoopSeconds > maxGo264LoopSeconds {
 		return fmt.Errorf("config: %s.loop_seconds: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	return nil
+}
+
+// validateGo264Geometry range-checks width and height. Zero is valid (the
+// runtime applies built-in defaults), so only out-of-range non-zero values are
+// rejected. 4:2:0 chroma requires even dimensions and go264.NewEncoder rejects
+// odd values, so fail at config load instead of at startup.
+func validateGo264Geometry(prefix string, g *Go264Config) error {
+	if g.Width != 0 && (g.Width < go264MinDimension || g.Width > go264MaxDimension) {
+		return fmt.Errorf("config: %s.width: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	if g.Height != 0 && (g.Height < go264MinDimension || g.Height > go264MaxDimension) {
+		return fmt.Errorf("config: %s.height: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	if g.Width%2 != 0 || g.Height%2 != 0 {
+		return fmt.Errorf("config: %s: %w", prefix, ErrProfileGo264FieldEven)
+	}
+	return nil
+}
+
+// validateGo264Rate range-checks the frame rate and quantizer.
+func validateGo264Rate(prefix string, g *Go264Config) error {
+	if g.FPS != 0 && (g.FPS < go264MinFPS || g.FPS > go264MaxFPS) {
+		return fmt.Errorf("config: %s.fps: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	if g.QP != 0 && (g.QP < go264MinQP || g.QP > go264MaxQP) {
+		return fmt.Errorf("config: %s.qp: %w", prefix, ErrProfileGo264FieldRange)
 	}
 	return nil
 }

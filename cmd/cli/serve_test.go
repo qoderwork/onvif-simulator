@@ -22,7 +22,7 @@ func TestRunServeSignalShutdown(t *testing.T) {
 
 	// This test signals its own pid. Register a handler BEFORE runServe starts:
 	// without one, SIGINT arriving before runServe installs its own handler hits
-	// Go's default behaviour and kills the whole test binary (`go test` then
+	// Go's default behavior and kills the whole test binary (`go test` then
 	// reports "signal: interrupt"). Having a handler registered means the signal
 	// is trapped for the lifetime of the test; runServe's own Notify is
 	// delivered alongside this one.

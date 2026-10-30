@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -22,6 +23,16 @@ const userHZ = 100
 // /proc/<pid>/stat (after comm), i.e. field 22 of the man-page layout.
 const procStatStartField = 22
 
+// procIdentity lookup failures. Declared at package scope so callers can match
+// them with errors.Is instead of comparing message text.
+var (
+	errProcInvalidPID     = errors.New("proc: invalid pid")
+	errProcStatNoComm     = errors.New("parse /proc/<pid>/stat: missing comm")
+	errProcStatFewFields  = errors.New("parse /proc/<pid>/stat: too few fields")
+	errProcStatNoBtime    = errors.New("parse /proc/stat: no btime line")
+	errProcStarttimeRange = errors.New("proc: starttime is out of int64 nanosecond range")
+)
+
 // processIdentity resolves a pid's executable path and creation time from
 // /proc. starttime is ticks since boot, so it is converted with the btime
 // value from /proc/stat to Unix nanoseconds that survive reboots. The tick
@@ -29,13 +40,13 @@ const procStatStartField = 22
 // check needs.
 func processIdentity(pid int) (procIdentity, error) {
 	if pid <= 0 {
-		return procIdentity{}, errors.New("proc: invalid pid")
+		return procIdentity{}, errProcInvalidPID
 	}
 	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if err != nil {
 		return procIdentity{}, fmt.Errorf("readlink /proc/%d/exe: %w", pid, err)
 	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)) //nolint:gosec // procfs path from a manifest pid.
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
 		return procIdentity{}, fmt.Errorf("read /proc/%d/stat: %w", pid, err)
 	}
@@ -44,14 +55,14 @@ func processIdentity(pid int) (procIdentity, error) {
 	// or parentheses, so split after the LAST ')' rather than tokenizing the
 	// whole line. The remainder starts at field 3 (state), which makes
 	// starttime index 22-3 = 19.
-	close := bytes.LastIndexByte(stat, ')')
-	if close < 0 || close+1 >= len(stat) {
-		return procIdentity{}, fmt.Errorf("parse /proc/%d/stat: missing comm", pid)
+	commEnd := bytes.LastIndexByte(stat, ')')
+	if commEnd < 0 || commEnd+1 >= len(stat) {
+		return procIdentity{}, fmt.Errorf("%w: pid %d", errProcStatNoComm, pid)
 	}
-	fields := strings.Fields(string(stat[close+1:]))
+	fields := strings.Fields(string(stat[commEnd+1:]))
 	idx := procStatStartField - 3
 	if len(fields) <= idx {
-		return procIdentity{}, fmt.Errorf("parse /proc/%d/stat: too few fields", pid)
+		return procIdentity{}, fmt.Errorf("%w: pid %d", errProcStatFewFields, pid)
 	}
 	ticks, err := strconv.ParseUint(fields[idx], 10, 64)
 	if err != nil {
@@ -61,11 +72,22 @@ func processIdentity(pid int) (procIdentity, error) {
 	if err != nil {
 		return procIdentity{}, err
 	}
+	// Ticks are scaled into nanoseconds, so the bound is checked before the
+	// uint64 -> int64 conversion rather than after it.
+	if ticks > maxStarttimeTicks {
+		return procIdentity{}, fmt.Errorf("%w: %d ticks", errProcStarttimeRange, ticks)
+	}
 	return procIdentity{
 		Exe:     exe,
 		StartNS: boot*int64(time.Second) + int64(ticks)*(int64(time.Second)/userHZ),
 	}, nil
 }
+
+// maxStarttimeTicks is the largest tick count that still fits an int64
+// nanosecond timestamp once scaled by time.Second/userHZ. Real uptimes are
+// orders of magnitude below it; the bound exists to keep the conversion
+// provably lossless (gosec G115).
+const maxStarttimeTicks = uint64(math.MaxInt64 / (int64(time.Second) / userHZ))
 
 // linuxBootTime returns the system boot time (Unix seconds) from /proc/stat.
 func linuxBootTime() (int64, error) {
@@ -84,7 +106,7 @@ func linuxBootTime() (int64, error) {
 		}
 		return btime, nil
 	}
-	return 0, errors.New("parse /proc/stat: no btime line")
+	return 0, errProcStatNoBtime
 }
 
 // processAlive reports whether pid refers to a running process.

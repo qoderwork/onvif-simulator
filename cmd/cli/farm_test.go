@@ -103,46 +103,54 @@ func TestWriteInstanceConfigsDerivesPerInstanceIdentity(t *testing.T) {
 
 	seenUUID := map[string]bool{}
 	seenSeed := map[int]bool{}
-	for i := 0; i < 2; i++ {
-		inst := f.manifest.Instances[i]
-		if inst.UUID == "" || seenUUID[inst.UUID] {
-			t.Fatalf("instance %d has empty or duplicate UUID %q", i, inst.UUID)
-		}
-		seenUUID[inst.UUID] = true
-		if inst.HTTPPort != 18080+i || inst.RTSPPort != 18554+i {
-			t.Fatalf("instance %d ports = %d/%d, want %d/%d",
-				i, inst.HTTPPort, inst.RTSPPort, 18080+i, 18554+i)
-		}
-		if inst.ControlPortFile == "" {
-			t.Fatalf("instance %d has no control-port file", i)
-		}
-
-		data, err := os.ReadFile(inst.ConfigPath)
-		if err != nil {
-			t.Fatalf("read instance %d config: %v", i, err)
-		}
-		var got config.Config
-		if err := json.Unmarshal(data, &got); err != nil {
-			t.Fatalf("parse instance %d config: %v", i, err)
-		}
-		if got.Device.Serial != "SN-TMPL-"+strconv.Itoa(i) {
-			t.Fatalf("instance %d serial = %q", i, got.Device.Serial)
-		}
-		if got.Runtime.DiscoveryMode != farmDiscoveryMode {
-			t.Fatalf("instance %d discovery = %q, want %q", i, got.Runtime.DiscoveryMode, farmDiscoveryMode)
-		}
-		p := got.Media.Profiles[0]
-		if p.Token != "profile_main-"+strconv.Itoa(i) {
-			t.Fatalf("instance %d token = %q", i, p.Token)
-		}
-		if p.Go264 == nil || p.Go264.Seed != i+1 {
-			t.Fatalf("instance %d go264 seed = %+v, want %d", i, p.Go264, i+1)
-		}
-		seenSeed[p.Go264.Seed] = true
+	for i := range 2 {
+		seed := assertDerivedIdentity(t, &f.manifest.Instances[i], i, seenUUID)
+		seenSeed[seed] = true
 	}
 	if len(seenSeed) != 2 {
 		t.Fatalf("seeds = %v, want two distinct values", seenSeed)
 	}
+}
+
+// assertDerivedIdentity checks every per-instance invariant for one derived
+// device and returns its go264 seed, so the caller can assert the seeds are
+// distinct across the farm.
+func assertDerivedIdentity(t *testing.T, inst *farmInstance, i int, seenUUID map[string]bool) int {
+	t.Helper()
+	if inst.UUID == "" || seenUUID[inst.UUID] {
+		t.Fatalf("instance %d has empty or duplicate UUID %q", i, inst.UUID)
+	}
+	seenUUID[inst.UUID] = true
+	if inst.HTTPPort != 18080+i || inst.RTSPPort != 18554+i {
+		t.Fatalf("instance %d ports = %d/%d, want %d/%d",
+			i, inst.HTTPPort, inst.RTSPPort, 18080+i, 18554+i)
+	}
+	if inst.ControlPortFile == "" {
+		t.Fatalf("instance %d has no control-port file", i)
+	}
+
+	data, err := os.ReadFile(inst.ConfigPath)
+	if err != nil {
+		t.Fatalf("read instance %d config: %v", i, err)
+	}
+	var got config.Config
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse instance %d config: %v", i, err)
+	}
+	if got.Device.Serial != "SN-TMPL-"+strconv.Itoa(i) {
+		t.Fatalf("instance %d serial = %q", i, got.Device.Serial)
+	}
+	if got.Runtime.DiscoveryMode != farmDiscoveryMode {
+		t.Fatalf("instance %d discovery = %q, want %q", i, got.Runtime.DiscoveryMode, farmDiscoveryMode)
+	}
+	p := got.Media.Profiles[0]
+	if p.Token != "profile_main-"+strconv.Itoa(i) {
+		t.Fatalf("instance %d token = %q", i, p.Token)
+	}
+	if p.Go264 == nil || p.Go264.Seed != i+1 {
+		t.Fatalf("instance %d go264 seed = %+v, want %d", i, p.Go264, i+1)
+	}
+	return p.Go264.Seed
 }
 
 // TestCloneConfigIsDeepCopy guards the derivation against aliasing the
@@ -241,7 +249,7 @@ func TestWriteInstanceConfigsAssignsClips(t *testing.T) {
 	}
 
 	want := []string{clipA, clipB, clipA}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		inst := f.manifest.Instances[i]
 		if inst.Clip != want[i] {
 			t.Fatalf("instance %d clip = %q, want %q", i, inst.Clip, want[i])

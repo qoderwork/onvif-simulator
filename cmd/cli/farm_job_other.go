@@ -7,8 +7,10 @@ package main
 // manifest after a crash.
 type farmJob struct{}
 
-// newFarmJob returns a nil job; every method tolerates a nil receiver.
-func newFarmJob() (*farmJob, error) { return nil, nil }
+// newFarmJob returns a job whose methods are all no-ops. It still returns a
+// non-nil value so callers never have to special-case "no job" — the Windows
+// counterpart returns nil only when creation actually failed.
+func newFarmJob() (*farmJob, error) { return &farmJob{}, nil }
 
 // assign is a no-op on non-Windows platforms.
 func (*farmJob) assign(int) error { return nil }

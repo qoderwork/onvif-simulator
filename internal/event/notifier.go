@@ -65,7 +65,7 @@ func (n *notifier) deliver(ctx context.Context, d *pushDispatch, onResult func(s
 		return
 	}
 	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
-	req.Header.Set("SOAPAction", notifySOAPAction)
+	req.Header.Set("SoapAction", notifySOAPAction)
 
 	resp, err := n.client.Do(req)
 	if err != nil {

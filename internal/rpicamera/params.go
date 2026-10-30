@@ -1,5 +1,9 @@
 package rpicamera
 
+// rpicamNormal is the wire value mtxrpicam expects for the Exposure, AfRange,
+// and AfSpeed parameters. Named because the same literal is sent three times.
+const rpicamNormal = "normal"
+
 // upstreamParams mirrors the parameter struct mtxrpicam expects on its
 // control pipe. Field names and order are part of the wire contract with
 // the binary released by mediamtx; do not rename.
@@ -65,7 +69,7 @@ func (p Params) hydrate() upstreamParams {
 		Contrast:            p.Contrast,
 		Saturation:          p.Saturation,
 		Sharpness:           p.Sharpness,
-		Exposure:            "normal",
+		Exposure:            rpicamNormal,
 		AWB:                 "auto",
 		AWBGainRed:          0,
 		AWBGainBlue:         0,
@@ -80,8 +84,8 @@ func (p Params) hydrate() upstreamParams {
 		Mode:                "",
 		FPS:                 p.FPS,
 		AfMode:              "continuous",
-		AfRange:             "normal",
-		AfSpeed:             "normal",
+		AfRange:             rpicamNormal,
+		AfSpeed:             rpicamNormal,
 		LensPosition:        0,
 		AfWindow:            "",
 		FlickerPeriod:       0,

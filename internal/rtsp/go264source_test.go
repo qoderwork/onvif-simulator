@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oops1/go.264"
+	go264 "github.com/oops1/go.264"
 )
 
 func TestNewGo264SourceProbe(t *testing.T) {
@@ -57,55 +57,69 @@ func TestGo264EncodePipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("go264.NewEncoder: %v", err)
 	}
-	defer enc.Close()
+	defer func() {
+		if closeErr := enc.Close(); closeErr != nil {
+			t.Errorf("enc.Close: %v", closeErr)
+		}
+	}()
 
 	// Encode GOPSize+1 frames: frame 0 must anchor with SPS+PPS+IDR, and
 	// the final frame (the next GOP boundary) must also be an IDR.
 	frames := int64(cfg.GOPSize + 1)
-	for frame := int64(0); frame < frames; frame++ {
-		rgba := g.drawFrame(frame)
-		i420 := rgbaToI420(rgba, cfg.Width, cfg.Height)
-		if len(i420) != cfg.Width*cfg.Height*3/2 {
-			t.Fatalf("i420 size = %d, want %d", len(i420), cfg.Width*cfg.Height*3/2)
-		}
-		annexB, encErr := enc.Encode(i420)
-		if encErr != nil {
-			t.Fatalf("encode frame %d: %v", frame, encErr)
-		}
-		nals := splitAnnexB(annexB)
-		if len(nals) == 0 {
-			t.Fatalf("frame %d: splitAnnexB returned no NALs", frame)
-		}
-		var hasSPS, hasPPS, hasIDR bool
-		for _, nal := range nals {
-			if len(nal) == 0 {
-				continue
-			}
-			switch nal[0] & 0x1F {
-			case 7:
-				hasSPS = true
-			case 8:
-				hasPPS = true
-			case 5:
-				hasIDR = true
-			}
-		}
+	for frame := range frames {
+		nals := encodeTestFrame(t, g, enc, frame)
+		hasSPS, hasPPS, hasIDR := classifyNALs(nals)
 		switch {
 		case frame == 0:
-			if !(hasSPS && hasPPS && hasIDR) {
+			if !hasSPS || !hasPPS || !hasIDR {
 				t.Fatalf("frame 0 missing parameter sets / IDR: sps=%v pps=%v idr=%v", hasSPS, hasPPS, hasIDR)
 			}
 		case frame%int64(cfg.GOPSize) == 0:
 			if !hasIDR {
 				t.Fatalf("frame %d (GOP boundary) has no IDR slice", frame)
 			}
-		default:
-			// P-frame within the GOP: must still carry at least one slice.
-			if len(nals) == 0 {
-				t.Fatalf("frame %d produced no NALs", frame)
-			}
 		}
 	}
+}
+
+// encodeTestFrame runs one frame through the exact path the producer uses:
+// draw, convert to I420, encode, split. It fails the test on any step that
+// yields nothing usable, so callers only inspect the result.
+func encodeTestFrame(t *testing.T, g *go264Source, enc *go264.Encoder, frame int64) [][]byte {
+	t.Helper()
+	rgba := g.drawFrame(frame)
+	i420 := rgbaToI420(rgba, g.cfg.Width, g.cfg.Height)
+	if want := g.cfg.Width * g.cfg.Height * i420Num / i420Den; len(i420) != want {
+		t.Fatalf("i420 size = %d, want %d", len(i420), want)
+	}
+	annexB, err := enc.Encode(i420)
+	if err != nil {
+		t.Fatalf("encode frame %d: %v", frame, err)
+	}
+	nals := splitAnnexB(annexB)
+	if len(nals) == 0 {
+		t.Fatalf("frame %d: splitAnnexB returned no NALs", frame)
+	}
+	return nals
+}
+
+// classifyNALs reports which of the three NAL types a decoder needs first are
+// present in one access unit: SPS (7), PPS (8), and an IDR slice (5).
+func classifyNALs(nals [][]byte) (sps, pps, idr bool) {
+	for _, nal := range nals {
+		if len(nal) == 0 {
+			continue
+		}
+		switch nal[0] & 0x1F {
+		case 7:
+			sps = true
+		case 8:
+			pps = true
+		case 5:
+			idr = true
+		}
+	}
+	return sps, pps, idr
 }
 
 func TestSplitAnnexB(t *testing.T) {
@@ -192,7 +206,7 @@ func TestGo264LoopModeReplaysCachedFrames(t *testing.T) {
 	timeout := time.After(20 * time.Second)
 	for len(aus) < want {
 		select {
-		case au := <-src.LiveSource.in:
+		case au := <-src.in:
 			aus = append(aus, au)
 		case <-timeout:
 			t.Fatalf("timed out after %d/%d access units", len(aus), want)

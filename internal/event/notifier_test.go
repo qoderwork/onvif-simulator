@@ -87,7 +87,7 @@ func TestNotifier_DeliverPOSTsSOAP(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		capturedCT = r.Header.Get("Content-Type")
-		capturedSOAPAction = r.Header.Get("SOAPAction")
+		capturedSOAPAction = r.Header.Get("SoapAction")
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)

@@ -591,6 +591,10 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 }
 
 // TestLoadToleratesUTF8BOM locks in the Windows-editor compatibility fix:
+// utf8BOM is the byte-order mark Notepad and PowerShell 5.1 prepend, which
+// encoding/json rejects unless the loader strips it.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
 // Notepad and PowerShell 5.1 write a UTF-8 BOM, which encoding/json rejects
 // with "invalid character '\ufeff'" unless the loader strips it.
 func TestLoadToleratesUTF8BOM(t *testing.T) {
@@ -601,9 +605,11 @@ func TestLoadToleratesUTF8BOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	bom := []byte{0xEF, 0xBB, 0xBF}
-	if err := os.WriteFile("onvif-simulator.json", append(bom, data...), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
+	bom := make([]byte, 0, len(utf8BOM)+len(data))
+	bom = append(bom, utf8BOM...)
+	bom = append(bom, data...)
+	if writeErr := os.WriteFile("onvif-simulator.json", bom, 0o600); writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
 	}
 
 	got, err := config.Load()

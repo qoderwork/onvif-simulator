@@ -57,7 +57,7 @@ const (
 //
 // Legacy manifests (no identity) are still killed: they predate the check and
 // the operator asked for a stop.
-func stopDecision(pid int, wantExe string, wantStart int64) (bool, string) {
+func stopDecision(pid int, wantExe string, wantStart int64) (kill bool, reason string) {
 	if pid <= 0 {
 		return false, "no pid recorded"
 	}

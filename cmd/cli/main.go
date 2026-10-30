@@ -420,13 +420,13 @@ func postControl(port int, path string, body []byte) error {
 	reqURL := "http://127.0.0.1:" + strconv.Itoa(port) + path
 	ctx, cancel := context.WithTimeout(context.Background(), controlServerTimeout)
 	defer cancel()
-	//nolint:gosec // reqURL targets the loopback control port written by this same process.
+	// reqURL targets the loopback control port this same process wrote, so the
+	// destination is not user-controlled.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	//nolint:gosec // HTTP destination is the loopback control port.
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err

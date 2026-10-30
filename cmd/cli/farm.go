@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -49,6 +50,10 @@ const (
 	// is unreliable (Windows in particular), so multicast discovery is
 	// disabled for every derived instance.
 	farmDiscoveryMode = "NonDiscoverable"
+	// defaultFarmReadyTimeout is the -ready-timeout default: long enough
+	// for a cold Go start plus config load, short enough that a broken
+	// template fails the farm in seconds rather than minutes.
+	defaultFarmReadyTimeout = 10 * time.Second
 )
 
 var (
@@ -74,6 +79,9 @@ var (
 	// errFarmManifestRequired means `farm stop` was not told where the
 	// manifest is.
 	errFarmManifestRequired = errors.New("farm stop: -manifest or -out is required")
+	// errFarmParentGone means a child checked its recorded farm supervisor
+	// pid and found a different parent, i.e. the farm was already killed.
+	errFarmParentGone = errors.New("serve: farm parent pid is gone")
 )
 
 // farmParentPIDEnv carries the supervisor pid into every child. serve checks
@@ -93,12 +101,13 @@ func checkFarmParent() error {
 	if raw == "" {
 		return nil
 	}
-	want, err := strconv.Atoi(raw)
-	if err != nil || want <= 0 {
-		return nil
-	}
-	if os.Getppid() != want {
-		return fmt.Errorf("serve: farm parent %d is gone", want)
+	// Written as "only act when the value parses and is positive" rather than
+	// "bail out when it does not": an unparsable or non-positive value means
+	// this process was not launched by a farm, which is not an error.
+	if want, err := strconv.Atoi(raw); err == nil && want > 0 {
+		if os.Getppid() != want {
+			return fmt.Errorf("%w: expected %d, got %d", errFarmParentGone, want, os.Getppid())
+		}
 	}
 	return nil
 }
@@ -203,6 +212,243 @@ func runFarm(args []string) error {
 	return runFarmStart(args)
 }
 
+// farmOptions is the parsed `farm start` command line.
+type farmOptions struct {
+	cfgPath      string
+	count        int
+	httpBase     int
+	rtspBase     int
+	outDir       string
+	readyTimeout time.Duration
+	logLevel     string
+	restart      bool
+	host         string
+	clipsDir     string
+}
+
+// farmPlan is everything farm derives from the template and flags before any
+// child process exists. Keeping it separate from the flags makes the
+// validation that must happen before a single port is bound explicit.
+type farmPlan struct {
+	tmpl       config.Config
+	resolved   string
+	dir        string
+	cleanupDir string
+	hostName   string
+	httpStart  int
+	httpEnd    int
+	rtspStart  int
+	rtspEnd    int
+	clips      []string
+}
+
+// resolveClips turns -clips into the sorted absolute paths assigned
+// round-robin to instances, overriding each template's media source (a go264
+// template becomes a file profile backed by the assigned clip).
+func resolveClips(dir string) ([]string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, nil
+	}
+	clips, err := listClips(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(clips) == 0 {
+		return nil, fmt.Errorf("%w: %s", errFarmNoClips, dir)
+	}
+	return clips, nil
+}
+
+// makeOutDir creates the output directory, returning it plus the directory to
+// remove on exit (empty when -out named one, since the operator owns it then).
+func makeOutDir(dir string) (outDir, cleanupDir string, err error) {
+	if dir != "" {
+		if mkErr := os.MkdirAll(dir, dirMode); mkErr != nil {
+			return "", "", fmt.Errorf("farm: create out dir: %w", mkErr)
+		}
+		return dir, "", nil
+	}
+	tmp, mkErr := os.MkdirTemp("", "onvif-farm-")
+	if mkErr != nil {
+		return "", "", fmt.Errorf("farm: create temp out dir: %w", mkErr)
+	}
+	return tmp, tmp, nil
+}
+
+// planFarm loads and validates the template, resolves clips, validates the two
+// port blocks, and creates the output directory. Everything that can fail
+// happens here, so a failure never leaves half a farm behind.
+func planFarm(opts *farmOptions) (*farmPlan, error) {
+	resolved, err := config.Resolve(opts.cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	if _, ensureErr := config.EnsureExists(resolved); ensureErr != nil {
+		return nil, ensureErr
+	}
+	config.SetPath(resolved)
+
+	tmpl, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	// Validate once up front: deriving N configs from an invalid template
+	// would start N children that all exit immediately, leaving the operator
+	// with "N launched, none ready" and a restart loop instead of one clear
+	// error.
+	if valErr := config.Validate(&tmpl); valErr != nil {
+		return nil, fmt.Errorf("farm: template config is invalid: %w", valErr)
+	}
+
+	clips, err := resolveClips(opts.clipsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve and validate the port blocks before creating anything on disk:
+	// an overlapping or out-of-range block makes some instances fail config
+	// validation on startup, which would look like "farm launched N but only
+	// M came up".
+	httpStart := tmpl.Network.HTTPPort
+	if opts.httpBase > 0 {
+		httpStart = opts.httpBase
+	}
+	rtspStart := tmpl.Network.RTSPPortOrDefault()
+	if opts.rtspBase > 0 {
+		rtspStart = opts.rtspBase
+	}
+	httpEnd, err := validatePortRange("http", httpStart, opts.count)
+	if err != nil {
+		return nil, err
+	}
+	rtspEnd, err := validatePortRange("rtsp", rtspStart, opts.count)
+	if err != nil {
+		return nil, err
+	}
+	if httpStart <= rtspEnd && rtspStart <= httpEnd {
+		return nil, fmt.Errorf("%w: http %d..%d, rtsp %d..%d",
+			errFarmPortOverlap, httpStart, httpEnd, rtspStart, rtspEnd)
+	}
+
+	dir, cleanupDir, err := makeOutDir(opts.outDir)
+	if err != nil {
+		return nil, err
+	}
+
+	hostName := strings.TrimSpace(opts.host)
+	if hostName == "" {
+		hostName = detectFarmHost()
+	}
+
+	return &farmPlan{
+		tmpl:       tmpl,
+		resolved:   resolved,
+		dir:        dir,
+		cleanupDir: cleanupDir,
+		hostName:   hostName,
+		httpStart:  httpStart,
+		httpEnd:    httpEnd,
+		rtspStart:  rtspStart,
+		rtspEnd:    rtspEnd,
+		clips:      clips,
+	}, nil
+}
+
+// newFarm builds the supervisor state from an already-validated plan.
+func newFarm(opts *farmOptions, plan *farmPlan) *farm {
+	f := &farm{
+		template:     plan.tmpl,
+		host:         plan.hostName,
+		outDir:       plan.dir,
+		restart:      opts.restart,
+		readyTimeout: opts.readyTimeout,
+		logLevel:     opts.logLevel,
+		cmds:         make(map[int]*exec.Cmd),
+		files:        make(map[int]*farmLogFiles),
+		started:      make(map[int]time.Time),
+		clips:        plan.clips,
+		manifest: farmManifest{
+			Count:     opts.count,
+			OutDir:    plan.dir,
+			ParentPID: os.Getpid(),
+			StartedAt: time.Now(),
+		},
+	}
+	// Fingerprint ourselves so `farm stop` can refuse to signal a pid that a
+	// later process reused. Unsupported platforms leave the fields empty and
+	// stop degrades to pid-only termination.
+	if id, idErr := processIdentity(os.Getpid()); idErr == nil {
+		f.manifest.ParentExe = id.Exe
+		f.manifest.ParentStartedNS = id.StartNS
+	}
+	return f
+}
+
+// attachJob puts every child in a Windows kill-on-close job object so a
+// crashed or force-killed farm cannot leave orphaned cameras holding ports.
+// Failure to create the job is not fatal (sandboxed/CI environments may
+// forbid nested jobs); `farm stop` still covers cleanup.
+func (f *farm) attachJob() func() {
+	job, jobErr := newFarmJob()
+	if jobErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: job object unavailable, children may outlive a hard kill: %v\n", jobErr)
+		return func() {}
+	}
+	f.job = job
+	return job.Close
+}
+
+// launchAll writes one config per instance and starts every child. Any spawn
+// failure tears the whole farm down: a partial farm is more confusing than a
+// clear error.
+func (f *farm) launchAll(count int, httpPortFor, rtspPortFor func(int) int, tmplDir string) error {
+	// Derive and write the configs up front so a crash during startup still
+	// leaves a complete, inspectable artifact set.
+	if err := f.writeInstanceConfigs(count, httpPortFor, rtspPortFor, tmplDir); err != nil {
+		return err
+	}
+	for i := range count {
+		if err := f.spawn(i); err != nil {
+			// Best-effort cleanup of already-spawned children; no supervisor
+			// goroutines exist yet, so reap them here or they become zombies.
+			f.beginShutdown()
+			f.killAllAndReap(farmShutdownTimeout)
+			return fmt.Errorf("farm: spawn instance %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// awaitReady polls readiness for every instance before declaring the farm up.
+// Zero ready instances is fatal; a straggler is only a warning.
+func (f *farm) awaitReady(count int) error {
+	ready, readyErr := f.waitReady(count)
+	if ready == 0 {
+		f.beginShutdown()
+		f.killAllAndReap(farmShutdownTimeout)
+		return fmt.Errorf("%w: %w", errFarmNoReady, readyErr)
+	}
+	if readyErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", readyErr)
+	}
+	return nil
+}
+
+// announce prints where the artifacts are. Always printed, including for the
+// implicit temp dir: a test harness needs the manifest path while the farm is
+// running, and the directory is only deleted on exit.
+func (f *farm) announce(plan *farmPlan) {
+	manifestPath := filepath.Join(plan.dir, "manifest.json")
+	if plan.cleanupDir != "" {
+		fmt.Printf("farm: launched %d instances in temp dir %s (removed on exit)\n", f.manifest.Count, plan.dir)
+	} else {
+		fmt.Printf("farm: launched %d instances in %s\n", f.manifest.Count, plan.dir)
+	}
+	fmt.Printf("farm: manifest at %s\n", manifestPath)
+	fmt.Printf("farm: devices at %s, http ports %d..%d, rtsp ports %d..%d\n",
+		plan.hostName, plan.httpStart, plan.httpEnd, plan.rtspStart, plan.rtspEnd)
+}
+
 func runFarmStart(args []string) error {
 	fs := flag.NewFlagSet("farm", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "template config (defaults to the user config dir)")
@@ -213,7 +459,7 @@ func runFarmStart(args []string) error {
 		"starting RTSP port; instance i uses rtsp-base+i (default: template rtsp_port)")
 	outDir := fs.String("out", "",
 		"directory for per-instance configs, logs, and manifest.json (default: a temp dir)")
-	readyTimeout := fs.Duration("ready-timeout", 10*time.Second,
+	readyTimeout := fs.Duration("ready-timeout", defaultFarmReadyTimeout,
 		"max time to wait per instance for its HTTP port to accept connections")
 	logLevel := fs.String("log-level", "info", "log level passed to each child serve process")
 	noRestart := fs.Bool("no-restart", false, "do not restart children that exit unexpectedly")
@@ -224,179 +470,50 @@ func runFarmStart(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// -count is the one flag with no usable default.
 	if *count <= 0 {
 		return errFarmCountInvalid
 	}
-
-	resolved, err := config.Resolve(*cfgPath)
+	opts := &farmOptions{
+		cfgPath:      *cfgPath,
+		count:        *count,
+		httpBase:     *httpBase,
+		rtspBase:     *rtspBase,
+		outDir:       *outDir,
+		readyTimeout: *readyTimeout,
+		logLevel:     *logLevel,
+		restart:      !*noRestart,
+		host:         *host,
+		clipsDir:     *clipsDir,
+	}
+	plan, err := planFarm(opts)
 	if err != nil {
 		return err
 	}
-	if _, err := config.EnsureExists(resolved); err != nil {
-		return err
-	}
-	config.SetPath(resolved)
-
-	tmpl, err := config.Load()
-	if err != nil {
-		return err
-	}
-	// Validate once up front: deriving N configs from an invalid template
-	// would start N children that all exit immediately, leaving the operator
-	// with "N launched, none ready" and a restart loop instead of one clear
-	// error.
-	if valErr := config.Validate(&tmpl); valErr != nil {
-		return fmt.Errorf("farm: template config is invalid: %w", valErr)
-	}
-
-	// Resolve -clips once: the sorted absolute paths are assigned round-robin
-	// to instances, overriding the template's media source (a go264 template
-	// becomes a file profile backed by the assigned clip).
-	var clips []string
-	if strings.TrimSpace(*clipsDir) != "" {
-		clips, err = listClips(*clipsDir)
-		if err != nil {
-			return err
-		}
-		if len(clips) == 0 {
-			return fmt.Errorf("%w: %s", errFarmNoClips, *clipsDir)
-		}
-	}
-
-	// Resolve and validate the port blocks before creating anything on disk:
-	// an overlapping or out-of-range block makes some instances fail config
-	// validation on startup, which would look like "farm launched N but only
-	// M came up".
-	httpStart := tmpl.Network.HTTPPort
-	if *httpBase > 0 {
-		httpStart = *httpBase
-	}
-	rtspStart := tmpl.Network.RTSPPortOrDefault()
-	if *rtspBase > 0 {
-		rtspStart = *rtspBase
-	}
-	httpEnd, err := validatePortRange("http", httpStart, *count)
-	if err != nil {
-		return err
-	}
-	rtspEnd, err := validatePortRange("rtsp", rtspStart, *count)
-	if err != nil {
-		return err
-	}
-	if httpStart <= rtspEnd && rtspStart <= httpEnd {
-		return fmt.Errorf("%w: http %d..%d, rtsp %d..%d",
-			errFarmPortOverlap, httpStart, httpEnd, rtspStart, rtspEnd)
-	}
-
-	dir := *outDir
-	cleanupDir := ""
-	if dir == "" {
-		dir, err = os.MkdirTemp("", "onvif-farm-")
-		if err != nil {
-			return fmt.Errorf("farm: create temp out dir: %w", err)
-		}
-		cleanupDir = dir
-	} else if err := os.MkdirAll(dir, dirMode); err != nil {
-		return fmt.Errorf("farm: create out dir: %w", err)
-	}
-	if cleanupDir != "" {
+	if plan.cleanupDir != "" {
 		// A temp dir is scratch space; it is kept only when -out names one.
 		defer func() {
-			_ = os.RemoveAll(cleanupDir) //nolint:errcheck // best-effort cleanup.
+			_ = os.RemoveAll(plan.cleanupDir) //nolint:errcheck // best-effort cleanup.
 		}()
 	}
 
-	httpPortFor := func(i int) int { return httpStart + i }
-	rtspPortFor := func(i int) int { return rtspStart + i }
+	f := newFarm(opts, plan)
+	defer f.attachJob()()
 
-	hostName := strings.TrimSpace(*host)
-	if hostName == "" {
-		hostName = detectFarmHost()
+	httpPortFor := func(i int) int { return plan.httpStart + i }
+	rtspPortFor := func(i int) int { return plan.rtspStart + i }
+	if err := f.launchAll(opts.count, httpPortFor, rtspPortFor, filepath.Dir(plan.resolved)); err != nil {
+		return err
 	}
-
-	f := &farm{
-		template:     tmpl,
-		host:         hostName,
-		outDir:       dir,
-		restart:      !*noRestart,
-		readyTimeout: *readyTimeout,
-		logLevel:     *logLevel,
-		cmds:         make(map[int]*exec.Cmd),
-		files:        make(map[int]*farmLogFiles),
-		started:      make(map[int]time.Time),
-		clips:        clips,
-		manifest: farmManifest{
-			Count:     *count,
-			OutDir:    dir,
-			ParentPID: os.Getpid(),
-			StartedAt: time.Now(),
-		},
-	}
-
-	// Fingerprint ourselves so `farm stop` can refuse to signal a pid that a
-	// later process reused. Unsupported platforms leave the fields empty and
-	// stop degrades to pid-only termination.
-	if id, idErr := processIdentity(os.Getpid()); idErr == nil {
-		f.manifest.ParentExe = id.Exe
-		f.manifest.ParentStartedNS = id.StartNS
-	}
-
-	// Windows: put every child in a kill-on-close job object so a crashed or
-	// force-killed farm cannot leave orphaned cameras holding ports. Failure
-	// to create the job is not fatal (sandboxed/CI environments may forbid
-	// nested jobs); `farm stop` still covers cleanup.
-	if job, jobErr := newFarmJob(); jobErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: job object unavailable, children may outlive a hard kill: %v\n", jobErr)
-	} else {
-		f.job = job
-		defer job.Close()
-	}
-
-	// Derive and write one config per instance up front so a crash during
-	// startup still leaves a complete, inspectable artifact set.
-	tmplDir := filepath.Dir(resolved)
-	if err := f.writeInstanceConfigs(*count, httpPortFor, rtspPortFor, tmplDir); err != nil {
+	if err := f.awaitReady(opts.count); err != nil {
 		return err
 	}
 
-	for i := range *count {
-		if err := f.spawn(i); err != nil {
-			// Best-effort cleanup of already-spawned children; no supervisor
-			// goroutines exist yet, so reap them here or they become zombies.
-			f.beginShutdown()
-			f.killAllAndReap(farmShutdownTimeout)
-			return fmt.Errorf("farm: spawn instance %d: %w", i, err)
-		}
-	}
-
-	// Poll readiness for every instance before declaring the farm up.
-	ready, readyErr := f.waitReady(*count)
-	if ready == 0 {
-		f.beginShutdown()
-		f.killAllAndReap(farmShutdownTimeout)
-		return fmt.Errorf("%w: %v", errFarmNoReady, readyErr)
-	}
-	if readyErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v\n", readyErr)
-	}
-
-	f.refreshControlPorts(*count)
-
+	f.refreshControlPorts(opts.count)
 	if err := f.writeManifest(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not write manifest: %v\n", err)
 	}
-	// Always print the manifest path, including for the implicit temp dir:
-	// a test harness needs it while the farm is running, and the directory
-	// is only deleted on exit.
-	manifestPath := filepath.Join(dir, "manifest.json")
-	if cleanupDir != "" {
-		fmt.Printf("farm: launched %d instances in temp dir %s (removed on exit)\n", *count, dir)
-	} else {
-		fmt.Printf("farm: launched %d instances in %s\n", *count, dir)
-	}
-	fmt.Printf("farm: manifest at %s\n", manifestPath)
-	fmt.Printf("farm: devices at %s, http ports %d..%d, rtsp ports %d..%d\n",
-		hostName, httpStart, httpEnd, rtspStart, rtspEnd)
+	f.announce(plan)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -404,7 +521,7 @@ func runFarmStart(args []string) error {
 	// Supervisor: one goroutine per slot restarts its child on unexpected
 	// exit. The parent loop blocks on the signal channel and tears down on
 	// SIGINT/SIGTERM.
-	for i := range *count {
+	for i := range opts.count {
 		f.supervisors.Add(1)
 		go func(slot int) {
 			defer f.supervisors.Done()
@@ -443,81 +560,10 @@ func (f *farm) waitChildren(timeout time.Duration) {
 // tokens, and writes the result to <out>/instance-<i>.json.
 func (f *farm) writeInstanceConfigs(count int, httpPortFor, rtspPortFor func(int) int, tmplDir string) error {
 	for i := range count {
-		inst, err := cloneConfig(&f.template)
+		inst, assignedClip, err := f.deriveInstance(i, httpPortFor, rtspPortFor, tmplDir)
 		if err != nil {
-			return fmt.Errorf("farm: clone template for instance %d: %w", i, err)
+			return err
 		}
-		inst.Device.UUID = "urn:uuid:" + uuid.NewString()
-		if inst.Device.Serial != "" {
-			inst.Device.Serial = inst.Device.Serial + "-" + strconv.Itoa(i)
-		} else {
-			inst.Device.Serial = "SN-" + strconv.Itoa(i)
-		}
-		inst.Network.HTTPPort = httpPortFor(i)
-		inst.Network.RTSPPort = rtspPortFor(i)
-
-		// Every instance must advertise its own XAddr. A template that pins
-		// network.xaddrs would otherwise make all instances claim the same
-		// endpoint, so aiovms would discover only one of them. Keep the host
-		// the operator chose and rewrite only the port.
-		for k, raw := range inst.Network.XAddrs {
-			u, perr := url.Parse(strings.TrimSpace(raw))
-			if perr != nil || u.Host == "" {
-				continue
-			}
-			u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(inst.Network.HTTPPort))
-			inst.Network.XAddrs[k] = u.String()
-		}
-
-		// Keep the ONVIF protocol table consistent with the ports this
-		// instance actually listens on; otherwise GetNetworkProtocols reports
-		// the template's ports for every device.
-		for k := range inst.Runtime.NetworkProtocols {
-			switch strings.ToUpper(strings.TrimSpace(inst.Runtime.NetworkProtocols[k].Name)) {
-			case "HTTP":
-				inst.Runtime.NetworkProtocols[k].Port = []int{inst.Network.HTTPPort}
-			case "RTSP":
-				inst.Runtime.NetworkProtocols[k].Port = []int{inst.Network.RTSPPortOrDefault()}
-			}
-		}
-
-		// aiovms adds devices by IP:port, so multicast discovery is not
-		// needed; several processes sharing UDP 3702 on one host would make
-		// startup non-deterministic.
-		inst.Runtime.DiscoveryMode = farmDiscoveryMode
-
-		// -clips overrides the template's source for every profile of this
-		// instance: each camera becomes a file-backed stream of its assigned
-		// clip, so a 12-up wall shows 12 different pictures at ~0 CPU (the
-		// looper only packetizes, it never encodes).
-		assignedClip := ""
-		if len(f.clips) > 0 {
-			assignedClip = f.clips[i%len(f.clips)]
-		}
-
-		// Make any relative media file path absolute against the template's
-		// directory so children (which may run from a different working
-		// directory) resolve it correctly regardless of the instance config
-		// location. Empty paths (embedded/go264 sources) are left alone.
-		for p := range inst.Media.Profiles {
-			if assignedClip != "" {
-				inst.Media.Profiles[p].Kind = config.ProfileKindFile
-				inst.Media.Profiles[p].MediaFilePath = assignedClip
-				inst.Media.Profiles[p].RPICam = nil
-				inst.Media.Profiles[p].Go264 = nil
-			} else if path := inst.Media.Profiles[p].MediaFilePath; path != "" && !filepath.IsAbs(path) {
-				inst.Media.Profiles[p].MediaFilePath = filepath.Join(tmplDir, path)
-			}
-			inst.Media.Profiles[p].Token = inst.Media.Profiles[p].Token + "-" + strconv.Itoa(i)
-			inst.Media.Profiles[p].Name = inst.Media.Profiles[p].Name + " " + strconv.Itoa(i)
-			// Give every go264 instance a different colour phase and ball
-			// path, so a 12-up wall does not look like 12 copies of one
-			// camera. A template that sets seed explicitly wins.
-			if g := inst.Media.Profiles[p].Go264; g != nil && g.Seed == 0 {
-				g.Seed = i + 1
-			}
-		}
-
 		// Validate the derived instance, not just the template: the port
 		// rewrite, relative-path resolution, and seed assignment are all
 		// farm-owned mutations, and failing here names the offending slot
@@ -541,8 +587,8 @@ func (f *farm) writeInstanceConfigs(count int, httpPortFor, rtspPortFor func(int
 			Serial:          inst.Device.Serial,
 			HTTPPort:        inst.Network.HTTPPort,
 			RTSPPort:        inst.Network.RTSPPortOrDefault(),
-			HTTPURL:         fmt.Sprintf("http://%s:%d", f.host, inst.Network.HTTPPort),
-			RTSPURL:         fmt.Sprintf("rtsp://%s:%d", f.host, inst.Network.RTSPPortOrDefault()),
+			HTTPURL:         "http://" + net.JoinHostPort(f.host, strconv.Itoa(inst.Network.HTTPPort)),
+			RTSPURL:         "rtsp://" + net.JoinHostPort(f.host, strconv.Itoa(inst.Network.RTSPPortOrDefault())),
 			ConfigPath:      path,
 			LogPath:         filepath.Join(f.outDir, fmt.Sprintf("instance-%d.log", i)),
 			OutPath:         filepath.Join(f.outDir, fmt.Sprintf("instance-%d.out.log", i)),
@@ -551,6 +597,106 @@ func (f *farm) writeInstanceConfigs(count int, httpPortFor, rtspPortFor func(int
 		})
 	}
 	return nil
+}
+
+// deriveInstance deep-copies the template and applies every per-instance
+// mutation: identity, ports, advertised endpoints, protocol table, discovery
+// mode, clip assignment, and profile tokens/seeds. It returns the config plus
+// the clip it assigned (empty when the template's own source was kept).
+func (f *farm) deriveInstance(
+	i int, httpPortFor, rtspPortFor func(int) int, tmplDir string,
+) (config.Config, string, error) {
+	inst, err := cloneConfig(&f.template)
+	if err != nil {
+		return config.Config{}, "", fmt.Errorf("farm: clone template for instance %d: %w", i, err)
+	}
+	inst.Device.UUID = "urn:uuid:" + uuid.NewString()
+	if inst.Device.Serial != "" {
+		inst.Device.Serial = inst.Device.Serial + "-" + strconv.Itoa(i)
+	} else {
+		inst.Device.Serial = "SN-" + strconv.Itoa(i)
+	}
+	inst.Network.HTTPPort = httpPortFor(i)
+	inst.Network.RTSPPort = rtspPortFor(i)
+
+	rewriteXAddrs(&inst)
+	syncNetworkProtocols(&inst)
+
+	// aiovms adds devices by IP:port, so multicast discovery is not needed;
+	// several processes sharing UDP 3702 on one host would make startup
+	// non-deterministic.
+	inst.Runtime.DiscoveryMode = farmDiscoveryMode
+
+	// -clips overrides the template's source for every profile of this
+	// instance: each camera becomes a file-backed stream of its assigned
+	// clip, so a 12-up wall shows 12 different pictures at ~0 CPU (the
+	// looper only packetizes, it never encodes).
+	assignedClip := ""
+	if len(f.clips) > 0 {
+		assignedClip = f.clips[i%len(f.clips)]
+	}
+	configureProfiles(&inst, i, assignedClip, tmplDir)
+	return inst, assignedClip, nil
+}
+
+// rewriteXAddrs points every advertised endpoint at this instance's HTTP port.
+// A template that pins network.xaddrs would otherwise make all instances claim
+// the same endpoint, so aiovms would discover only one of them. The host the
+// operator chose is kept; only the port is rewritten.
+func rewriteXAddrs(inst *config.Config) {
+	for k, raw := range inst.Network.XAddrs {
+		u, perr := url.Parse(strings.TrimSpace(raw))
+		if perr != nil || u.Host == "" {
+			continue
+		}
+		u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(inst.Network.HTTPPort))
+		inst.Network.XAddrs[k] = u.String()
+	}
+}
+
+// syncNetworkProtocols keeps the ONVIF protocol table consistent with the
+// ports this instance actually listens on; otherwise GetNetworkProtocols
+// reports the template's ports for every device.
+func syncNetworkProtocols(inst *config.Config) {
+	for k := range inst.Runtime.NetworkProtocols {
+		switch strings.ToUpper(strings.TrimSpace(inst.Runtime.NetworkProtocols[k].Name)) {
+		case "HTTP":
+			inst.Runtime.NetworkProtocols[k].Port = []int{inst.Network.HTTPPort}
+		case "RTSP":
+			inst.Runtime.NetworkProtocols[k].Port = []int{inst.Network.RTSPPortOrDefault()}
+		}
+	}
+}
+
+// configureProfiles applies the per-profile mutations for one instance: the
+// -clips override or relative-path resolution, unique token/name suffixes, and
+// a distinct go264 seed so the wall does not show N copies of one camera.
+func configureProfiles(inst *config.Config, i int, assignedClip, tmplDir string) {
+	for p := range inst.Media.Profiles {
+		switch {
+		case assignedClip != "":
+			inst.Media.Profiles[p].Kind = config.ProfileKindFile
+			inst.Media.Profiles[p].MediaFilePath = assignedClip
+			inst.Media.Profiles[p].RPICam = nil
+			inst.Media.Profiles[p].Go264 = nil
+		default:
+			// Make any relative media file path absolute against the
+			// template's directory so children (which may run from a
+			// different working directory) resolve it correctly regardless of
+			// the instance config location. Empty paths (embedded/go264
+			// sources) are left alone.
+			path := inst.Media.Profiles[p].MediaFilePath
+			if path != "" && !filepath.IsAbs(path) {
+				inst.Media.Profiles[p].MediaFilePath = filepath.Join(tmplDir, path)
+			}
+		}
+		inst.Media.Profiles[p].Token = inst.Media.Profiles[p].Token + "-" + strconv.Itoa(i)
+		inst.Media.Profiles[p].Name = inst.Media.Profiles[p].Name + " " + strconv.Itoa(i)
+		// A template that sets seed explicitly wins.
+		if g := inst.Media.Profiles[p].Go264; g != nil && g.Seed == 0 {
+			g.Seed = i + 1
+		}
+	}
 }
 
 // listClips returns the absolute paths of every .mp4 in dir, sorted by name
@@ -622,7 +768,9 @@ func (f *farm) spawn(i int) error {
 	// only owns the stdout/stderr redirect. -control-port-file keeps each
 	// instance's loopback control port in its own file instead of the
 	// per-user default that all children would otherwise overwrite.
-	cmd := exec.Command(self, "serve", //nolint:gosec // self path comes from os.Executable.
+	// The context is only a handle for the linter's benefit: child lifetime is
+	// owned by the supervisor, which terminates the process explicitly.
+	cmd := exec.CommandContext(context.Background(), self, "serve", //nolint:gosec // self path comes from os.Executable.
 		"-config", inst.ConfigPath,
 		"-log-level", f.logLevel,
 		"-log-file", inst.LogPath,
@@ -800,7 +948,7 @@ func (f *farm) waitReady(count int) (int, error) {
 		addr := "127.0.0.1:" + strconv.Itoa(port)
 		deadline := time.Now().Add(f.readyTimeout)
 		for time.Now().Before(deadline) {
-			conn, err := net.DialTimeout("tcp", addr, farmDialTimeout)
+			conn, err := dialProbe(addr)
 			if err == nil {
 				_ = conn.Close() //nolint:errcheck // best-effort.
 				readyCh <- i
@@ -824,6 +972,15 @@ func (f *farm) waitReady(count int) (int, error) {
 	wg.Wait()
 	close(readyCh)
 	return len(readyCh), firstErr
+}
+
+// dialProbe opens a short-lived TCP connection to addr for a liveness probe.
+// It routes through a context-carrying net.Dialer rather than
+// net.DialTimeout, and it is deliberately given a background context: the
+// probe must respect its own dial timeout, not the caller's lifetime.
+func dialProbe(addr string) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: farmDialTimeout}
+	return dialer.DialContext(context.Background(), "tcp", addr)
 }
 
 // beginShutdown flips the shutdown flag so supervisor goroutines stop

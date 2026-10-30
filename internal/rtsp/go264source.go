@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oops1/go.264"
+	go264 "github.com/oops1/go.264"
 
 	"github.com/GyeongHoKim/onvif-simulator/internal/obs"
 )
@@ -35,6 +35,41 @@ const (
 	maxGo264LoopSeconds = 300
 )
 
+// Buffer geometry and test-pattern constants. Named rather than inline so the
+// pixel arithmetic below stays readable, and so a mistyped digit is not
+// silently a valid "magic number".
+const (
+	// rgbaChannels is the byte stride of one RGBA pixel (R, G, B, A).
+	rgbaChannels = 4
+	// i420Num/i420Den give the I420 plane size: w*h*3/2 bytes.
+	i420Num = 3
+	i420Den = 2
+	// maxSample is the inclusive upper bound of an 8-bit sample.
+	maxSample = 255
+	// sampleMask keeps an int inside 8 bits before the narrowing
+	// conversion, which is what makes byte(x & sampleMask) provably
+	// lossless (gosec G115).
+	sampleMask = 0xFF
+	// stripeScrollPixels is the horizontal scroll speed of the stripe
+	// pattern, in pixels per frame.
+	stripeScrollPixels = 4
+	// stripeDriftR/G/B are the per-frame palette drifts of the R/G/B
+	// channels, in samples per frame. Differing rates make the stripe
+	// pattern cycle through hues instead of pulsing one channel.
+	stripeDriftR = 2
+	stripeDriftG = 1
+	stripeDriftB = 3
+	// ballPhasePrime spreads the ball's start phase across seeds so N
+	// instances do not move in lockstep.
+	ballPhasePrime = 97
+	// ballSineRate/ballCosineRate are the angular rates (rad/s) of the
+	// ball's Lissajous path.
+	ballSineRate   = 1.3
+	ballCosineRate = 1.7
+	// annexBStartCodeLen is the length of a 00 00 01 Annex-B start code.
+	annexBStartCodeLen = 3
+)
+
 // ErrGo264ModeInvalid is returned by NewGo264Source for an unknown Mode.
 var ErrGo264ModeInvalid = errors.New("rtsp: go264 mode must be \"live\" or \"loop\"")
 
@@ -51,13 +86,13 @@ type Go264SourceConfig struct {
 	Mode string
 	// LoopSeconds is the warm-up length for Go264ModeLoop (default 5).
 	LoopSeconds int
-	// Seed varies the colour phase and ball path so several instances look
+	// Seed varies the color phase and ball path so several instances look
 	// like different cameras.
 	Seed int
 }
 
 // defaultGo264Config returns the baseline test-encoder settings. 1280x720@30
-// matches the bundled embedded sample so behaviour between the "file" and
+// matches the bundled embedded sample so behavior between the "file" and
 // "go264" source kinds is visually consistent; operators can dial the
 // resolution down if the test host is CPU-constrained (the encoder is
 // pure-Go and scales with pixels x fps).
@@ -102,8 +137,13 @@ type go264Source struct {
 // closeEncoder releases the encoder at most once.
 func (g *go264Source) closeEncoder() {
 	g.closeOnce.Do(func() {
-		if g.enc != nil {
-			g.enc.Close()
+		if g.enc == nil {
+			return
+		}
+		if err := g.enc.Close(); err != nil {
+			// Nothing actionable at teardown, but the encoder can report a
+			// flush failure and that is worth a line in the log.
+			g.logger.Warn("rtsp go264: encoder close", "error", err)
 		}
 	})
 }
@@ -204,7 +244,7 @@ func (g *go264Source) Run(ctx context.Context) error {
 	// Ensure the AU channel is closed so a lingering Push (racing the
 	// cancel) is dropped rather than blocking, and so LiveSource.Run's
 	// channel-close path is not double-triggered.
-	g.LiveSource.Close()
+	g.Close()
 	return err
 }
 
@@ -238,8 +278,8 @@ func (g *go264Source) produceLive(produceCtx context.Context, baseTS uint32) {
 	// Reuse both frame buffers across ticks: at 720p30 a fresh RGBA+I420
 	// pair per frame would allocate ~5 MB x 30/s.
 	w, h := g.cfg.Width, g.cfg.Height
-	rgba := make([]byte, w*h*4)
-	i420 := make([]byte, w*h*3/2)
+	rgba := make([]byte, w*h*rgbaChannels)
+	i420 := make([]byte, w*h*i420Num/i420Den)
 
 	var frameIdx int64
 	for {
@@ -270,8 +310,8 @@ func (g *go264Source) produceLive(produceCtx context.Context, baseTS uint32) {
 func (g *go264Source) produceLoop(produceCtx context.Context, baseTS uint32) {
 	frameDur := time.Duration(float64(time.Second) / float64(g.cfg.FPS))
 	w, h := g.cfg.Width, g.cfg.Height
-	rgba := make([]byte, w*h*4)
-	i420 := make([]byte, w*h*3/2)
+	rgba := make([]byte, w*h*rgbaChannels)
+	i420 := make([]byte, w*h*i420Num/i420Den)
 
 	total := g.cfg.LoopSeconds * g.cfg.FPS
 	if total < 1 {
@@ -280,7 +320,7 @@ func (g *go264Source) produceLoop(produceCtx context.Context, baseTS uint32) {
 	cache := make([][][]byte, 0, total)
 
 	next := time.Now()
-	for i := 0; i < total; i++ {
+	for i := range total {
 		if produceCtx.Err() != nil {
 			return
 		}
@@ -354,7 +394,7 @@ func (g *go264Source) encodeFrame(rgba, i420 []byte, idx int64) ([][]byte, bool)
 // accumulating a per-frame delta, so fps values that do not divide 90000
 // (7, 11, ...) stay on the exact grid instead of drifting.
 func (g *go264Source) pushAccessUnit(baseTS uint32, frameIdx int64, nals [][]byte) {
-	g.LiveSource.Push(AccessUnit{
+	g.Push(AccessUnit{
 		PTS:  int64(baseTS) + frameIdx*int64(videoClockRate)/int64(g.cfg.FPS),
 		NTP:  time.Now(),
 		NALs: nals,
@@ -374,7 +414,7 @@ func cloneNALs(nals [][]byte) [][]byte {
 // drawFrame renders one frame into a freshly allocated RGBA buffer. Callers
 // on the hot path should prefer drawFrameInto with a reused buffer.
 func (g *go264Source) drawFrame(idx int64) []byte {
-	rgba := make([]byte, g.cfg.Width*g.cfg.Height*4)
+	rgba := make([]byte, g.cfg.Width*g.cfg.Height*rgbaChannels)
 	g.drawFrameInto(rgba, idx)
 	return rgba
 }
@@ -390,40 +430,42 @@ func (g *go264Source) drawFrameInto(rgba []byte, idx int64) {
 	seed := g.cfg.Seed
 
 	// Scroll speed in pixels per frame; keeps motion obvious at any fps.
-	scroll := int(idx*4) + seed*13
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			v := (x + y + scroll) % 256
-			i := (y*w + x) * 4
-			rgba[i] = byte((v + int(idx*2) + seed*5) % 256)
-			rgba[i+1] = byte((v*2 + int(idx) + seed*3) % 256)
-			rgba[i+2] = byte((255 - v + int(idx*3) + seed*7) % 256)
-			rgba[i+3] = 255
+	scroll := int(idx)*stripeScrollPixels + seed*13
+	for y := range h {
+		for x := range w {
+			v := (x + y + scroll) % (maxSample + 1)
+			i := (y*w + x) * rgbaChannels
+			// The mask is what makes the narrowing conversion lossless; every
+			// term is non-negative, so "and" behaves like "mod 256" here.
+			rgba[i] = byte((v + int(idx)*stripeDriftR + seed*5) & sampleMask)
+			rgba[i+1] = byte((v*2 + int(idx)*stripeDriftG + seed*3) & sampleMask)
+			rgba[i+2] = byte((maxSample - v + int(idx)*stripeDriftB + seed*7) & sampleMask)
+			rgba[i+3] = maxSample
 		}
 	}
 
 	// Bouncing ball — a clear focal motion independent of the stripes. The
 	// seed offsets both phases so every camera gets a different trajectory.
-	t := float64(idx)/float64(g.cfg.FPS) + float64(seed%97)*0.11 // seconds
-	cx := int((math.Sin(t*1.3)*0.5 + 0.5) * float64(w-1))
-	cy := int((math.Cos(t*1.7)*0.5 + 0.5) * float64(h-1))
+	t := float64(idx)/float64(g.cfg.FPS) + float64(seed%ballPhasePrime)*0.11 // seconds
+	cx := int((math.Sin(t*ballSineRate)*0.5 + 0.5) * float64(w-1))
+	cy := int((math.Cos(t*ballCosineRate)*0.5 + 0.5) * float64(h-1))
 	radius := w / 12
 	r2 := radius * radius
-	for y := 0; y < h; y++ {
+	for y := range h {
 		dy := y - cy
 		if dy < -radius || dy > radius {
 			continue
 		}
-		for x := 0; x < w; x++ {
+		for x := range w {
 			dx := x - cx
 			if dx < -radius || dx > radius {
 				continue
 			}
 			if dx*dx+dy*dy <= r2 {
-				i := (y*w + x) * 4
-				rgba[i] = 255
-				rgba[i+1] = 255
-				rgba[i+2] = 255
+				i := (y*w + x) * rgbaChannels
+				rgba[i] = maxSample
+				rgba[i+1] = maxSample
+				rgba[i+2] = maxSample
 			}
 		}
 	}
@@ -433,7 +475,7 @@ func (g *go264Source) drawFrameInto(rgba []byte, idx int64) {
 // (Y, then half-resolution U and V). Callers on the hot path should prefer
 // rgbaToI420Into with a reused buffer.
 func rgbaToI420(rgba []byte, w, h int) []byte {
-	out := make([]byte, w*h*3/2)
+	out := make([]byte, w*h*i420Num/i420Den)
 	rgbaToI420Into(out, rgba, w, h)
 	return out
 }
@@ -448,27 +490,29 @@ func rgbaToI420Into(out, rgba []byte, w, h int) {
 	uPlane := out[w*h : w*h+cw*ch]
 	vPlane := out[w*h+cw*ch:]
 
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			i := (y*w + x) * 4
+	for y := range h {
+		for x := range w {
+			i := (y*w + x) * rgbaChannels
 			r := int(rgba[i])
 			g := int(rgba[i+1])
 			b := int(rgba[i+2])
 			yy := (77*r + 150*g + 29*b + 128) >> 8
-			if yy < 0 {
+			if yy > maxSample {
+				yy = maxSample
+			} else if yy < 0 {
 				yy = 0
-			} else if yy > 255 {
-				yy = 255
 			}
-			yPlane[y*w+x] = byte(yy)
+			// The mask is redundant after the clamp but is what makes the
+			// narrowing conversion provably lossless (gosec G115).
+			yPlane[y*w+x] = byte(yy & sampleMask)
 		}
 	}
 
 	for y := 0; y < h; y += 2 {
 		for x := 0; x < w; x += 2 {
 			var rSum, gSum, bSum int
-			for dy := 0; dy < 2; dy++ {
-				for dx := 0; dx < 2; dx++ {
+			for dy := range 2 {
+				for dx := range 2 {
 					xi := x + dx
 					yi := y + dy
 					if xi >= w {
@@ -477,7 +521,7 @@ func rgbaToI420Into(out, rgba []byte, w, h int) {
 					if yi >= h {
 						yi = h - 1
 					}
-					i := (yi*w + xi) * 4
+					i := (yi*w + xi) * rgbaChannels
 					rSum += int(rgba[i])
 					gSum += int(rgba[i+1])
 					bSum += int(rgba[i+2])
@@ -490,13 +534,13 @@ func rgbaToI420Into(out, rgba []byte, w, h int) {
 			v := (127*r - 106*g - 21*b + 128) >> 8
 			if u < 0 {
 				u = 0
-			} else if u > 255 {
-				u = 255
+			} else if u > maxSample {
+				u = maxSample
 			}
 			if v < 0 {
 				v = 0
-			} else if v > 255 {
-				v = 255
+			} else if v > maxSample {
+				v = maxSample
 			}
 			ci := (y>>1)*cw + (x >> 1)
 			uPlane[ci] = byte(u)
@@ -521,20 +565,20 @@ func splitAnnexB(data []byte) [][]byte {
 	i := 0
 	for i < n-2 {
 		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
-			scEnd = append(scEnd, i+3)
-			i += 3
+			scEnd = append(scEnd, i+annexBStartCodeLen)
+			i += annexBStartCodeLen
 		} else {
 			i++
 		}
 	}
 
-	for j := 0; j < len(scEnd); j++ {
+	for j := range scEnd {
 		start := scEnd[j]
 		var end int
 		if j+1 < len(scEnd) {
 			// Stop before the next delimiter; its leading zero bytes are not
 			// part of this NAL.
-			end = scEnd[j+1] - 3
+			end = scEnd[j+1] - annexBStartCodeLen
 		} else {
 			end = n
 		}

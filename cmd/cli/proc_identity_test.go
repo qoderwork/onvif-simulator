@@ -7,6 +7,10 @@ import (
 	"testing"
 )
 
+// errTestNoSuchProcess stands in for a platform lookup that found no process.
+// It is package-scoped so err113 does not treat it as a dynamic error.
+var errTestNoSuchProcess = errors.New("no such process")
+
 func TestIdentityMatches(t *testing.T) {
 	t.Parallel()
 
@@ -23,7 +27,7 @@ func TestIdentityMatches(t *testing.T) {
 }
 
 // TestSameExeDeletedSuffix covers Linux reporting " (deleted)" after the
-// running binary was replaced: `farm stop` must still recognise its child.
+// running binary was replaced: `farm stop` must still recognize its child.
 func TestSameExeDeletedSuffix(t *testing.T) {
 	t.Parallel()
 
@@ -74,7 +78,7 @@ func TestStopDecisionSkipsExitedProcess(t *testing.T) {
 	old := processIdentityFn
 	t.Cleanup(func() { processIdentityFn = old })
 	processIdentityFn = func(int) (procIdentity, error) {
-		return procIdentity{}, errors.New("no such process")
+		return procIdentity{}, errTestNoSuchProcess
 	}
 
 	// 2^31-1 is above every real pid_max and does not exist.

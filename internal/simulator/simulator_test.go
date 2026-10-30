@@ -52,7 +52,10 @@ func newTestSimulator(t *testing.T) (sim *Simulator, cleanup func()) {
 			Serial:       "SN-1",
 			Scopes:       []string{"onvif://www.onvif.org/name/test"},
 		},
-		Network: config.NetworkConfig{HTTPPort: freePort(t)},
+		// Both ports must be reserved: RTSPPort left at 0 would fall back to
+		// config.DefaultRTSPPort, which every other Simulator built from a
+		// fixture would then race for when packages run in parallel.
+		Network: config.NetworkConfig{HTTPPort: freePort(t), RTSPPort: freePort(t)},
 		Media: config.MediaConfig{Profiles: []config.ProfileConfig{{
 			Name: "main", Token: "profile_main",
 			MediaFilePath: "",

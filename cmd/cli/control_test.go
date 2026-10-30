@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,11 +17,43 @@ import (
 	"github.com/GyeongHoKim/onvif-simulator/internal/simulator"
 )
 
+// freePort reserves an ephemeral port by opening and immediately closing a
+// listener. Tests that start a server must not hard-code one: `go test` runs
+// packages in parallel, so two packages picking the same fixed port (the RTSP
+// default 8554 is the easy mistake) fail with "address already in use" on CI
+// while passing locally.
+func freePort(t *testing.T) int {
+	t.Helper()
+	lc := &net.ListenConfig{}
+	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	defer func() {
+		if closeErr := l.Close(); closeErr != nil {
+			t.Fatalf("close probe listener: %v", closeErr)
+		}
+	}()
+	tcpAddr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", l.Addr())
+	}
+	return tcpAddr.Port
+}
+
 // writeTempConfig writes a minimal valid config into a temp dir and returns
 // its absolute path. Callers pass the path to simulator.Options.ConfigPath
 // (the explicit override path is the public way for tests to point the
 // simulator at a fixture; chdir is no longer relied on).
 func writeTempConfig(t *testing.T) (cfgPath string, cleanup func()) {
+	t.Helper()
+	return writeTempConfigWithPorts(t, 18081, 0)
+}
+
+// writeTempConfigWithPorts is writeTempConfig with explicit network ports.
+// rtspPort 0 keeps the config default, which only tests that never bind an
+// RTSP listener should rely on.
+func writeTempConfigWithPorts(t *testing.T, httpPort, rtspPort int) (cfgPath string, cleanup func()) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Config{
@@ -30,7 +63,7 @@ func writeTempConfig(t *testing.T) (cfgPath string, cleanup func()) {
 			Manufacturer: "Test", Model: "SimCam", Serial: "SN-1",
 			Scopes: []string{"onvif://www.onvif.org/name/test"},
 		},
-		Network: config.NetworkConfig{HTTPPort: 18081, RTSPPort: 0},
+		Network: config.NetworkConfig{HTTPPort: httpPort, RTSPPort: rtspPort},
 		Media: config.MediaConfig{Profiles: []config.ProfileConfig{{
 			Name: "main", Token: "profile_main",
 			// RTSP retained as a passthrough fallback so this fixture covers

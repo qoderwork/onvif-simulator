@@ -12,7 +12,10 @@ import (
 )
 
 func TestRunServeSignalShutdown(t *testing.T) {
-	cfgPath, cleanup := writeTempConfig(t)
+	// Both listeners must be on reserved ephemeral ports: `go test` runs
+	// packages in parallel, and the shared fixture's RTSP default (8554) is
+	// also bound by internal/simulator tests.
+	cfgPath, cleanup := writeTempConfigWithPorts(t, freePort(t), freePort(t))
 	defer cleanup()
 
 	// Use a temp HOME/USERPROFILE so writeControlPortFile lands somewhere ephemeral.

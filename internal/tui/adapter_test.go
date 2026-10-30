@@ -12,23 +12,35 @@ import (
 	"github.com/GyeongHoKim/onvif-simulator/internal/simulator"
 )
 
-func newTestAdapter(t *testing.T) (sa *simulatorAdapter, cleanup func()) {
+// freePort reserves an ephemeral port by opening and immediately closing a
+// listener. The adapter starts a real Simulator, which binds both the HTTP and
+// the RTSP port; hard-coding either (or leaving RTSP at its 8554 default) races
+// with other packages when `go test` runs them in parallel.
+func freePort(t *testing.T) int {
 	t.Helper()
-	dir := t.TempDir()
-
 	lc := &net.ListenConfig{}
 	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("probe listen: %v", err)
 	}
+	defer func() {
+		if closeErr := l.Close(); closeErr != nil {
+			t.Fatalf("close probe listener: %v", closeErr)
+		}
+	}()
 	tcpAddr, ok := l.Addr().(*net.TCPAddr)
 	if !ok {
 		t.Fatalf("expected *net.TCPAddr, got %T", l.Addr())
 	}
-	port := tcpAddr.Port
-	if err = l.Close(); err != nil {
-		t.Fatalf("close probe listener: %v", err)
-	}
+	return tcpAddr.Port
+}
+
+func newTestAdapter(t *testing.T) (sa *simulatorAdapter, cleanup func()) {
+	t.Helper()
+	dir := t.TempDir()
+
+	port := freePort(t)
+	rtspPort := freePort(t)
 
 	cfg := config.Config{
 		Version: config.CurrentVersion,
@@ -38,7 +50,7 @@ func newTestAdapter(t *testing.T) (sa *simulatorAdapter, cleanup func()) {
 			Model:        "Sim",
 			Serial:       "SN-A1",
 		},
-		Network: config.NetworkConfig{HTTPPort: port},
+		Network: config.NetworkConfig{HTTPPort: port, RTSPPort: rtspPort},
 		Media: config.MediaConfig{Profiles: []config.ProfileConfig{{
 			Name:          "main",
 			Token:         "profile_main",

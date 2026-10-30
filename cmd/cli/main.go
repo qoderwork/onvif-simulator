@@ -6,6 +6,7 @@
 //	tui                      start the TUI (delegates to internal/tui.Run)
 //	config show              print the loaded config as JSON
 //	config validate          validate the config file and exit
+//	farm                     launch N distinct simulated devices from a template
 //	event <topic> <args...>  trigger an event via the loopback control port
 //
 // Running without arguments is equivalent to `serve`.
@@ -77,6 +78,8 @@ func run(args []string) error {
 		return runConfig(args[1:])
 	case "event":
 		return runEvent(args[1:])
+	case "farm":
+		return runFarm(args[1:])
 	case "version", "--version", "-v":
 		printVersion(os.Stdout)
 		return nil
@@ -99,6 +102,8 @@ func printUsage(w io.Writer) {
 		"  tui                            run the terminal UI",
 		"  config show                    print the loaded config JSON",
 		"  config validate                validate the config file and exit",
+		"  farm                           launch N distinct simulated devices from a template",
+		"  farm stop -manifest <path>     terminate a farm (and orphans) from its manifest",
 		"  version                        print version, commit, build channel",
 		"  event motion <token> on|off",
 		"  event digital-input <token> on|off",
@@ -106,6 +111,7 @@ func printUsage(w io.Writer) {
 		"  event image-too-dark <token> on|off",
 		"  event image-too-bright <token> on|off",
 		"  event sync <topic> <source-item-name> <source-token> <data-item-name> <state>",
+		"  event ... -control-port-file <path>   target one farm instance",
 	}
 	_, _ = io.WriteString(w, strings.Join(lines, "\n")+"\n") //nolint:errcheck // usage output is best-effort.
 }
@@ -163,11 +169,19 @@ func firstNonEmpty(values ...string) string {
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to onvif-simulator.json (overrides working directory default)")
+	ctlPath := fs.String("control-port-file", "",
+		"path of the file that receives the loopback control port (default: ~/.onvif-simulator/control.port)")
 	lf := registerLogFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	lvl, file := lf.resolveOverrides()
+
+	// When started by `farm`, refuse to run if the supervisor is already gone
+	// (covers a Pdeathsig signal missed in the fork window on Linux).
+	if err := checkFarmParent(); err != nil {
+		return err
+	}
 
 	sim, err := simulator.New(simulator.Options{
 		ConfigPath: *cfgPath,
@@ -205,7 +219,7 @@ func runServe(args []string) error {
 	}
 	fmt.Printf("control port %d\n", ctrl.port)
 
-	portFilePath, writeErr := writeControlPortFile(ctrl.port)
+	portFilePath, writeErr := writeControlPortFile(*ctlPath, ctrl.port)
 	if writeErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not write control port file: %v\n", writeErr)
 	}
@@ -327,15 +341,22 @@ type eventBody struct {
 }
 
 func runEvent(args []string) error {
-	if len(args) == 0 {
+	fs := flag.NewFlagSet("event", flag.ContinueOnError)
+	ctlPath := fs.String("control-port-file", "",
+		"path of the control-port file written by serve (default: ~/.onvif-simulator/control.port)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
 		return errEventSubcommandReq
 	}
-	port, err := readControlPortFile()
+	port, err := readControlPortFile(*ctlPath)
 	if err != nil {
 		return fmt.Errorf("%w: %w", errControlNotRunning, err)
 	}
-	sub := args[0]
-	rest := args[1:]
+	sub := rest[0]
+	rest = rest[1:]
 	switch sub {
 	case "motion", "digital-input", "image-too-blurry", "image-too-dark", "image-too-bright":
 		return postSimpleEvent(port, sub, rest)
@@ -431,10 +452,16 @@ func controlPortFilePath() (string, error) {
 	return filepath.Join(home, ".onvif-simulator", "control.port"), nil
 }
 
-func writeControlPortFile(port int) (string, error) {
-	path, err := controlPortFilePath()
-	if err != nil {
-		return "", err
+// writeControlPortFile persists port at path. An empty path uses the
+// per-user default; farm passes a per-instance path so N children on one
+// host do not overwrite each other.
+func writeControlPortFile(path string, port int) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		defaultPath, err := controlPortFilePath()
+		if err != nil {
+			return "", err
+		}
+		path = defaultPath
 	}
 	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
 		return "", err
@@ -442,12 +469,15 @@ func writeControlPortFile(port int) (string, error) {
 	return path, os.WriteFile(path, []byte(strconv.Itoa(port)+"\n"), fileMode)
 }
 
-func readControlPortFile() (int, error) {
-	path, err := controlPortFilePath()
-	if err != nil {
-		return 0, err
+func readControlPortFile(path string) (int, error) {
+	if strings.TrimSpace(path) == "" {
+		defaultPath, err := controlPortFilePath()
+		if err != nil {
+			return 0, err
+		}
+		path = defaultPath
 	}
-	data, err := os.ReadFile(path) //nolint:gosec // trusted path under user home.
+	data, err := os.ReadFile(path) //nolint:gosec // trusted path under user home or farm out dir.
 	if err != nil {
 		return 0, err
 	}

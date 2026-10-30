@@ -188,7 +188,7 @@ func TestControlPortFileRoundtrip(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	t.Setenv("USERPROFILE", tmp) // os.UserHomeDir uses USERPROFILE on Windows
 
-	path, err := writeControlPortFile(54321)
+	path, err := writeControlPortFile("", 54321)
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestControlPortFileRoundtrip(t *testing.T) {
 		t.Fatalf("expected port file under HOME, got %s", path)
 	}
 
-	port, err := readControlPortFile()
+	port, err := readControlPortFile("")
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -204,10 +204,20 @@ func TestControlPortFileRoundtrip(t *testing.T) {
 		t.Fatalf("expected 54321, got %d", port)
 	}
 
+	// An explicit path overrides the per-user default, which is what lets a
+	// farm run N children on one host without them clobbering each other.
+	explicit := filepath.Join(t.TempDir(), "nested", "cam0.ctl")
+	if _, err := writeControlPortFile(explicit, 54322); err != nil {
+		t.Fatalf("write explicit: %v", err)
+	}
+	if got, err := readControlPortFile(explicit); err != nil || got != 54322 {
+		t.Fatalf("read explicit = %d, %v; want 54322, nil", got, err)
+	}
+
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
-	if _, err := readControlPortFile(); err == nil {
+	if _, err := readControlPortFile(""); err == nil {
 		t.Fatal("expected error reading missing port file")
 	}
 }

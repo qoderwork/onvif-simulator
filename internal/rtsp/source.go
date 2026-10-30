@@ -3,6 +3,7 @@ package rtsp
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
@@ -41,14 +42,40 @@ type Source interface {
 	Run(ctx context.Context) error
 }
 
-// NewFileSource probes the mp4 at path and returns a Source that loops it
-// through the embedded RTSP server. The probe runs synchronously so the
-// caller learns about invalid files immediately rather than after the
-// goroutine spawns.
+// NewFileSource opens the mp4 at path, probes it, and returns a Source that
+// loops it through the embedded RTSP server. The probe runs synchronously so
+// the caller learns about invalid files immediately rather than after the
+// goroutine spawns. The file handle stays open for the rest of the process
+// (Source has no Close hook because profile sources are only added once at
+// startup) and is rewound on each loop iteration.
 func NewFileSource(path string) (Source, error) {
-	probe, err := Probe(path)
+	f, err := openMP4(path)
 	if err != nil {
-		return nil, fmt.Errorf("rtsp: probe %s: %w", path, err)
+		return nil, fmt.Errorf("rtsp: open %s: %w", path, err)
 	}
-	return &looper{path: path, probe: probe}, nil
+	probe, err := probeReader(f)
+	if err != nil {
+		_ = f.Close() //nolint:errcheck // best-effort cleanup on probe failure
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		_ = f.Close() //nolint:errcheck // best-effort cleanup on seek failure
+		return nil, fmt.Errorf("rtsp: seek %s: %w", path, err)
+	}
+	return &looper{reader: f, probe: probe}, nil
+}
+
+// NewFileSourceFromReader builds a Source that loops an mp4 supplied as an
+// in-memory reader (for example an //go:embed asset), so callers need no
+// on-disk file and no ffmpeg pre-generation step. The reader is rewound on
+// each loop iteration, so it must be an io.ReadSeeker.
+func NewFileSourceFromReader(r io.ReadSeeker) (Source, error) {
+	probe, err := probeReader(r)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return &looper{reader: r, probe: probe}, nil
 }

@@ -340,6 +340,62 @@ func TestValidateProfileSourceKind(t *testing.T) {
 			},
 			wantErr: config.ErrProfileRPICamExtraArgs,
 		},
+		{
+			name: "go264 odd width rejected",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 641, Height: 480},
+			},
+			wantErr: config.ErrProfileGo264FieldEven,
+		},
+		{
+			name: "go264 odd height rejected",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 640, Height: 361},
+			},
+			wantErr: config.ErrProfileGo264FieldEven,
+		},
+		{
+			name: "go264 even dimensions accepted",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 640, Height: 360, FPS: 15},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "go264 loop mode accepted",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 640, Height: 360, FPS: 15, Mode: config.Go264ModeLoop, LoopSeconds: 3},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "go264 live mode accepted",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 640, Height: 360, FPS: 15, Mode: config.Go264ModeLive},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "go264 unknown mode rejected",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 640, Height: 360, Mode: "stream"},
+			},
+			wantErr: config.ErrProfileGo264ModeInvalid,
+		},
+		{
+			name: "go264 loop_seconds out of range rejected",
+			profile: config.ProfileConfig{
+				Name: "n", Token: "t", Kind: config.ProfileKindGo264,
+				Go264: &config.Go264Config{Width: 640, Height: 360, Mode: config.Go264ModeLoop, LoopSeconds: 301},
+			},
+			wantErr: config.ErrProfileGo264FieldRange,
+		},
 	}
 
 	for _, tc := range cases {
@@ -387,12 +443,18 @@ func TestProfileConfigHasSource(t *testing.T) {
 		p    config.ProfileConfig
 		want bool
 	}{
-		{"empty", config.ProfileConfig{}, false},
+		// An empty profile (kind "" -> file) with no path now resolves to
+		// the embedded sample, so it has a source.
+		{"empty", config.ProfileConfig{}, true},
 		{"file with path", config.ProfileConfig{MediaFilePath: "/x.mp4"}, true},
-		{"file kind no path", config.ProfileConfig{Kind: config.ProfileKindFile}, false},
-		{"file kind whitespace path", config.ProfileConfig{Kind: config.ProfileKindFile, MediaFilePath: "  "}, false},
+		// File kind with no/whitespace path falls back to the embedded
+		// sample, so it still has a source.
+		{"file kind no path", config.ProfileConfig{Kind: config.ProfileKindFile}, true},
+		{"file kind whitespace path", config.ProfileConfig{Kind: config.ProfileKindFile, MediaFilePath: "  "}, true},
 		{"rpicam kind with config", config.ProfileConfig{Kind: config.ProfileKindRPICam, RPICam: &config.RPICamConfig{}}, true},
 		{"rpicam kind without config", config.ProfileConfig{Kind: config.ProfileKindRPICam}, false},
+		{"go264 with config", config.ProfileConfig{Kind: config.ProfileKindGo264, Go264: &config.Go264Config{}}, true},
+		{"go264 without config", config.ProfileConfig{Kind: config.ProfileKindGo264}, false},
 		{"unknown kind", config.ProfileConfig{Kind: "v4l2"}, false},
 	}
 	for _, tc := range cases {
@@ -525,6 +587,31 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round-trip mismatch:\ngot  %+v\nwant %+v", got, want)
+	}
+}
+
+// TestLoadToleratesUTF8BOM locks in the Windows-editor compatibility fix:
+// Notepad and PowerShell 5.1 write a UTF-8 BOM, which encoding/json rejects
+// with "invalid character '\ufeff'" unless the loader strips it.
+func TestLoadToleratesUTF8BOM(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	data, err := json.Marshal(validConfig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	if err := os.WriteFile("onvif-simulator.json", append(bom, data...), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load with BOM: %v", err)
+	}
+	if got.Device.UUID != validConfig.Device.UUID {
+		t.Fatalf("UUID = %q, want %q", got.Device.UUID, validConfig.Device.UUID)
 	}
 }
 

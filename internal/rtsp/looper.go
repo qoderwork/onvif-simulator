@@ -43,8 +43,8 @@ type codecEncoder interface {
 // ends the looper rewinds and continues with monotonically-increasing RTP
 // timestamps so clients see one continuous stream. It implements Source.
 type looper struct {
-	path  string
-	probe *ProbeResult
+	reader io.ReadSeeker
+	probe  *ProbeResult
 
 	stream *gortsplib.ServerStream
 	media  *description.Media
@@ -107,14 +107,11 @@ func (l *looper) playOnce(
 	enc codecEncoder,
 	baseTS uint32,
 ) (uint32, error) {
-	f, err := openMP4(l.path)
-	if err != nil {
-		return baseTS, err
+	if _, err := l.reader.Seek(0, io.SeekStart); err != nil {
+		return baseTS, fmt.Errorf("rtsp: seek mp4: %w", err)
 	}
-	defer closeQuiet(f)
-
 	pres := &pmp4.Presentation{}
-	if parseErr := pres.Unmarshal(f); parseErr != nil {
+	if parseErr := pres.Unmarshal(l.reader); parseErr != nil {
 		return baseTS, fmt.Errorf("rtsp: parse mp4 during playback: %w", parseErr)
 	}
 	track, err := videoTrack(pres)

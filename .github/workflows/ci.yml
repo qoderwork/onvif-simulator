@@ -134,3 +134,23 @@ jobs:
       # otherwise hide on the default linux/amd64 build.
       - name: Cross-compile rpicam-tagged code
         run: just rpicam-build-check
+
+  go264-build-check:
+    name: Go264 nohwaccel build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: .go-version
+          cache: true
+
+      - uses: extractions/setup-just@v3
+
+      # go.264 ships hardware-accelerated encoder backends that are compiled out
+      # only when the go264_nohwaccel tag is set. Every headless build uses that
+      # tag, so keep it compiling and green even though the untagged path is the
+      # one `test` exercises.
+      - name: Build and test with the go264_nohwaccel tag
+        run: just go264-build-check

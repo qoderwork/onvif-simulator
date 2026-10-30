@@ -20,6 +20,9 @@ coverage/
 # Build artifacts from go build/run in project root
 *.exe
 *.test
+# `go build ./cmd/cli` writes an extension-less binary named after the
+# package, so the patterns above do not cover it.
+/cli
 
 # Web
 

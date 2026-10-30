@@ -155,7 +155,96 @@ Run a single virtual device directly from the command line.
 onvif-simulator serve
 # List available options
 onvif-simulator serve --help
+# Launch N virtual devices from one template config (ports, UUIDs, serials, and
+# profile tokens are derived per instance; a manifest.json lists every endpoint)
+onvif-simulator farm -config ./onvif-simulator.json -count 10 -out ./farm
 ```
+
+`farm` validates the template once, spawns one `serve` child per instance, waits
+for each HTTP port to accept connections, and restarts children that exit
+unexpectedly until it receives SIGINT/SIGTERM (or the console is closed — see
+the Windows note below). Per instance it derives a fresh UUID, a serial suffix,
+HTTP/RTSP ports (`base+i`), profile token/name suffixes, a per-instance control
+port file, a `go264.seed` when the template leaves it zero, and the clip
+assigned by `-clips` (if used), and it rewrites
+`network.xaddrs` and `runtime.network_protocols` so each device advertises only
+its own endpoints. `manifest.json` lists every endpoint (including
+`control_port`/`control_port_file`), and its path is printed even when `-out`
+is omitted.
+
+`-http-base`/`-rtsp-base` pin the starting ports; overlapping or out-of-range
+blocks are rejected before any child starts, and zero ready instances abort the
+farm. `-ready-timeout` bounds the per-instance readiness probe, `-no-restart`
+leaves exited children down, and `-host` sets the host used in `manifest.json`
+URLs (default: the first non-loopback IPv4). Discovery is forced to
+`NonDiscoverable`: add the devices by `IP:port`, because several processes
+sharing UDP 3702 on one host is unreliable. A child that keeps exiting is
+stopped after five consecutive rapid restarts. When `-out` is omitted the
+scratch directory (configs, logs, manifest) is deleted on exit, after every
+child has been reaped; pass `-out` to keep it. Use `farm-template.json` as a
+starting template.
+
+#### Per-camera media with `-clips`
+
+`-clips <dir>` assigns the `.mp4` files in that directory, sorted by name, to
+instances round-robin and makes **every** profile of the instance a `file`
+source for that clip (a `go264`/`rpicam` template is overridden, which is the
+cheapest way to show 10+ visually different cameras: the looper only packetizes,
+so each instance costs ~0% CPU):
+
+```bash
+onvif-simulator farm -config ./farm-template.json -count 12 -clips ./clips -out ./farm
+# instance 0 -> clips/cam01.mp4, instance 1 -> clips/cam02.mp4, ... wraps at the end
+```
+
+The assignment is recorded per instance as `clip` in `manifest.json`. Clips must
+be H.264/H.265 mp4 with an absolute or `-clips`-relative location; keep them
+short (a few hundred KB) and distinct (labels/colours) so the wall is readable.
+
+#### Stopping a farm
+
+```bash
+onvif-simulator farm stop -manifest ./farm/manifest.json      # or -out ./farm
+```
+
+`farm stop` kills the supervisor first (so it cannot respawn children), then
+every recorded instance, and waits until the HTTP ports are closed. It works on
+a live farm and on one whose parent was force-killed, so it is the recovery path
+for a stale farm holding ports.
+
+The manifest also fingerprints every process (executable path + creation time,
+`parent_exe`/`parent_started_ns` and `exe`/`started_ns`). Before signalling,
+`farm stop` verifies the pid still belongs to that exact process; if the OS
+reused the pid for something else, it skips it and says
+`pid reused by another process` instead of killing an unrelated program.
+Manifests written before this check (no fingerprint) are still stopped
+pid-only, and a hand-edited manifest may carry a UTF-8 BOM. Fingerprinting is
+only available on Windows and Linux; on macOS/BSD there is no supported way to
+read another process's identity, so `farm stop` degrades to pid-only matching
+and could theoretically signal an unrelated process that reused a recorded
+pid — the same risk as with a pre-fingerprint manifest.
+
+Parent-death handling is automatic on the two main desktop platforms:
+
+- **Windows** — every child is placed in a kill-on-close **job object**, so a
+  crash or `taskkill /F /PID <farm-pid>` takes the children with it.
+- **Linux** — every child is started with `Pdeathsig=SIGKILL`, so the kernel
+  kills it when the farm dies. (`SIGKILL` is uncatchable, so this path is not
+  graceful; logs may miss the final line. A start-up check catches the tiny
+  fork→prctl window.)
+- **macOS/BSD** — no equivalent kernel mechanism; an external `kill -9` can
+  leave children running, so use `farm stop` afterwards.
+
+Triggering events for one camera in a farm:
+
+```bash
+onvif-simulator event -control-port-file ./farm/instance-3.ctl motion profile_main-3 on
+```
+
+**Windows note:** an external SIGTERM/SIGINT cannot be delivered to a
+background Go process. Stop a console session with Ctrl+C, or run
+`farm stop -manifest ...` from another shell; a raw `taskkill /F` of the farm is
+also safe now because the job object reaps the children.
 
 ### TUI Mode
 
@@ -183,6 +272,37 @@ The features are the same as the TUI mode.
 ### `onvif-simulator.json`
 
 onvif-simulator embeds its own RTSP server. For each profile, point `media_file_path` at a local H.264/H.265 mp4 file; the simulator loops it and serves an RTSP stream at `rtsp://<host>:<rtsp_port>/<profile token>`, which is what `GetStreamUri` returns.
+
+Leaving `media_file_path` empty is valid: the profile loops a small H.264 clip
+compiled into the binary, so a fresh config streams without any media file.
+Profile `kind` values:
+
+| `kind`   | source                                                                 |
+|----------|------------------------------------------------------------------------|
+| `file`   | (default) loop `media_file_path`, or the embedded sample when empty     |
+| `rpicam` | Raspberry Pi camera via `mtxrpicam`                                    |
+| `go264`  | pure-Go synthetic H.264 encoder (moving test pattern, no media file)   |
+
+`kind=go264` takes `"go264": {"width": 640, "height": 360, "fps": 15, "qp": 28, "gop_size": 15, "mode": "loop", "loop_seconds": 3}`
+(all fields optional; defaults are 1280x720@30, `mode` `"live"`, `loop_seconds` 5).
+Width and height must be even. Neither embedded-sample nor `go264` profiles get
+an MJPEG sibling profile, because there is no on-disk file for ffmpeg to
+transcode.
+
+`go264.mode` picks between two producer strategies:
+
+| `mode` | behaviour | cost |
+|--------|-----------|------|
+| `live` (default) | encode one fresh frame per frame interval, forever | ~1 core per 640x360@15 instance, constant |
+| `loop` | encode `loop_seconds` of video once at startup, then replay the cached access units | one core during warm-up only; ~0 after |
+
+`loop` is what makes 10+ synthetic cameras on one host affordable: a 12-instance
+farm built from `farm-template.json` (640x360@15, `loop_seconds: 3`) spends a
+few seconds of CPU per instance at startup and then idles. `live` is the right
+choice for one or two cameras that must never repeat. Measured on an
+i9-11900 with `ForceSoftware`: 320x180@10 ≈ 24 ms/frame, 640x360@15 ≈ 91 ms/frame,
+1280x720@30 ≈ 83 ms/frame wall (multi-threaded, several cores). Scale the
+resolution down first when the host is CPU-constrained.
 
 #### File location
 
@@ -272,7 +392,7 @@ Copy-Item onvif-simulator.example.json onvif-simulator.json
 
 > **Notes:**
 > - `network.rtsp_port` is optional and defaults to `8554` when omitted or set to `0`; it must differ from `http_port`.
-> - `media_file_path` must be an absolute path to an mp4 with an H.264 or H.265 video track.
+> - `media_file_path` must be an absolute path to an mp4 with an H.264 or H.265 video track. Omit it (or leave it empty) to loop the embedded sample clip instead.
 > - When `media_file_path` is set, `encoding`, `width`, `height`, and `fps` are read from the file at startup (via probe) and replace the in-memory profile values for the running simulator; `bitrate` and `gop_length` are not derived from the file and still come from the config for ONVIF. Persisted JSON values for the probe-derived fields are only used as fallback display data when the simulator is stopped.
 
 If you don't have a sample clip handy, generate one with ffmpeg:

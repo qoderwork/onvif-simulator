@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/GyeongHoKim/onvif-simulator/internal/config"
@@ -134,8 +135,10 @@ var errUnknownSourceKind = errors.New("simulator: unknown source kind")
 // should store on Simulator.derivedMJPEGProfiles.
 //
 // A profile is "usable" when ProfileConfig.HasSource reports true: kind=file
-// with a non-empty media_file_path, or kind=rpicam with rpicam params. When
-// no profile is usable the returned server is nil and StreamURI continues to
+// (a non-empty media_file_path plays that file; an empty one loops the
+// embedded sample clip), kind=go264 with a go264 config, or kind=rpicam with
+// rpicam params. When no profile is usable the returned server is nil and
+// StreamURI continues to
 // emit the conventional rtsp://host:port/<token> URL even without an active
 // listener, so clients can detect the absence as "no media on that path".
 //
@@ -318,13 +321,43 @@ var (
 	errMJPEGUnsupportedParentKind = errors.New("simulator: cannot derive MJPEG sibling for this profile kind")
 )
 
+// rtspGo264Mode maps the config package's go264 mode constant onto the rtsp
+// package's equivalent. Both spell the values "live" and "loop"; the mapping
+// keeps internal/rtsp free of a config import.
+func rtspGo264Mode(mode string) string {
+	if mode == config.Go264ModeLoop {
+		return rtsp.Go264ModeLoop
+	}
+	return rtsp.Go264ModeLive
+}
+
 // buildRTSPSource maps a ProfileConfig source kind to the matching
 // rtsp.Source. The kind=rpicam branch returns rpicamera.ErrUnsupported on
 // builds without the rpicam tag.
 func buildRTSPSource(p *config.ProfileConfig, logger *slog.Logger) (rtsp.Source, error) {
 	switch effectiveKind := p.Kind; effectiveKind {
 	case "", config.ProfileKindFile:
+		// An empty media_file_path means "use the embedded sample clip"
+		// (main.mp4 bundled into the binary). This lets `serve` start a
+		// working RTSP stream with zero external asset dependencies.
+		if strings.TrimSpace(p.MediaFilePath) == "" {
+			return rtsp.EmbeddedSampleSource()
+		}
 		return rtsp.NewFileSource(p.MediaFilePath)
+	case config.ProfileKindGo264:
+		// Pure-Go synthetic H.264 source — no media file, no camera. The
+		// Go264 block is guaranteed non-nil by validateProfileSource.
+		g := p.Go264
+		return rtsp.NewGo264Source(rtsp.Go264SourceConfig{
+			Width:       g.Width,
+			Height:      g.Height,
+			FPS:         g.FPS,
+			QP:          g.QP,
+			GOPSize:     g.GOPSize,
+			Mode:        rtspGo264Mode(g.Mode),
+			LoopSeconds: g.LoopSeconds,
+			Seed:        g.Seed,
+		}, logger.With("profile", p.Token))
 	case config.ProfileKindRPICam:
 		// Conversions are bounded by validateRPICam (CameraID >= 0, Width/
 		// Height in [0,4096], FPS in [0,120], Bitrate/IDRPeriod >= 0), so

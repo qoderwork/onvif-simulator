@@ -41,6 +41,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -257,6 +258,10 @@ type MetadataConfig struct {
 const (
 	ProfileKindFile   = "file"
 	ProfileKindRPICam = "rpicam"
+	// ProfileKindGo264 drives a pure-Go synthetic H.264 source (no media
+	// file, no camera). It is useful for headless test farms where a moving
+	// stream is wanted without ffmpeg pre-generation or hardware capture.
+	ProfileKindGo264 = "go264"
 )
 
 // ProfileConfig describes a single ONVIF media profile.
@@ -287,6 +292,10 @@ type ProfileConfig struct {
 	// RPICam configures the live Raspberry Pi camera capture. Required when
 	// Kind == "rpicam"; must be omitted otherwise.
 	RPICam *RPICamConfig `json:"rpicam,omitempty"`
+	// Go264 configures the pure-Go synthetic H.264 source. Required when
+	// Kind == "go264"; must be omitted otherwise. All sub-fields are
+	// optional and fall back to built-in test defaults when zero.
+	Go264 *Go264Config `json:"go264,omitempty"`
 
 	Encoding  string `json:"encoding,omitempty"`
 	Width     int    `json:"width,omitempty"`
@@ -324,15 +333,70 @@ type RPICamConfig struct {
 	ExtraArgs []string `json:"extra_args,omitempty"`
 }
 
+// Go264Config configures the pure-Go synthetic H.264 source. The encoder is
+// software-only (github.com/oops1/go.264 with ForceSoftware) so it runs on
+// any headless host. All fields are optional; the runtime applies the
+// defaults in rtsp.defaultGo264Config when a field is zero.
+//
+// Resolution is the main CPU lever: the encoder is pixel-rate bound, so
+// halving width and height roughly quarters the encode cost at a fixed fps.
+type Go264Config struct {
+	Width   int `json:"width,omitempty"`
+	Height  int `json:"height,omitempty"`
+	FPS     int `json:"fps,omitempty"`
+	QP      int `json:"qp,omitempty"`
+	GOPSize int `json:"gop_size,omitempty"`
+	// Mode selects how frames are produced:
+	//   "live" (default) — encode one frame per frame interval forever.
+	//   "loop"           — encode LoopSeconds of video once at startup, then
+	//                      replay the cached access units at the target frame
+	//                      rate. Steady-state CPU drops to near zero, which is
+	//                      what makes 10+ synthetic cameras affordable on one
+	//                      host; the cost is a one-off warm-up per instance.
+	Mode string `json:"mode,omitempty"`
+	// LoopSeconds is the warm-up length for Mode "loop". Defaults to 5.
+	LoopSeconds int `json:"loop_seconds,omitempty"`
+	// Seed varies the synthetic pattern (color phase and ball path) so
+	// several go264 instances on one host look like different cameras.
+	Seed int `json:"seed,omitempty"`
+}
+
+// Go264Mode values accepted on Go264Config.Mode. An empty Mode defaults to
+// Go264ModeLive so configs written before the field existed keep streaming.
+const (
+	Go264ModeLive = "live"
+	Go264ModeLoop = "loop"
+)
+
+// Accepted ranges for the go264 synthetic source. The bounds mirror what the
+// pure-Go encoder will accept, so an out-of-range value fails at config load
+// instead of at stream start.
+const (
+	go264MinDimension = 16
+	go264MaxDimension = 4096
+	go264MinFPS       = 1
+	go264MaxFPS       = 120
+	go264MinQP        = 1
+	go264MaxQP        = 51
+	// maxGo264LoopSeconds caps the loop-mode warm-up cache (300 s at 30 fps
+	// is 9000 access units) so a typo cannot turn one instance into an OOM.
+	maxGo264LoopSeconds = 300
+)
+
 // HasSource reports whether the profile is configured to drive an RTSP track.
-// A "file" profile needs a non-empty MediaFilePath; an "rpicam" profile needs
-// a non-nil RPICam (its required-fields check is enforced by Validate).
+// A "file" profile always has a source — either the configured MediaFilePath
+// or the built-in embedded sample when MediaFilePath is empty. An "rpicam"
+// profile needs a non-nil RPICam (its required-fields check is enforced by
+// Validate). A "go264" profile always has a source (it is generated in
+// process) as long as it carries a non-nil Go264 block.
 func (p *ProfileConfig) HasSource() bool {
 	switch p.Kind {
 	case "", ProfileKindFile:
-		return strings.TrimSpace(p.MediaFilePath) != ""
+		return true
 	case ProfileKindRPICam:
 		return p.RPICam != nil
+	case ProfileKindGo264:
+		return p.Go264 != nil
 	default:
 		return false
 	}
@@ -415,8 +479,8 @@ var (
 	// ErrProfileEncodingInvalid means profile.encoding is not a supported value.
 	ErrProfileEncodingInvalid = errors.New("config: profile.encoding must be one of H264, H265, MJPEG")
 
-	// ErrProfileKindInvalid means profile.kind is set to a value other than "file" or "rpicam".
-	ErrProfileKindInvalid = errors.New("config: profile.kind must be \"file\" or \"rpicam\"")
+	// ErrProfileKindInvalid means profile.kind is set to a value other than "file", "rpicam", or "go264".
+	ErrProfileKindInvalid = errors.New("config: profile.kind must be \"file\", \"rpicam\", or \"go264\"")
 	// ErrProfileKindFileWithRPICam means profile.kind=="file" but profile.rpicam was provided.
 	ErrProfileKindFileWithRPICam = errors.New("config: profile.rpicam must be omitted when kind is \"file\"")
 	// ErrProfileKindRPICamWithFile means profile.kind=="rpicam" but profile.media_file_path was set.
@@ -430,6 +494,20 @@ var (
 	// ErrProfileRPICamDuplicateCameraID means two profiles target the same Raspberry Pi camera.
 	ErrProfileRPICamDuplicateCameraID = errors.New(
 		"config: profile.rpicam.camera_id must be unique across rpicam profiles")
+	// ErrProfileKindGo264WithFile means profile.kind=="go264" but profile.media_file_path was set.
+	ErrProfileKindGo264WithFile = errors.New("config: profile.media_file_path must be empty when kind is \"go264\"")
+	// ErrProfileKindGo264WithRPICam means profile.kind=="go264" but profile.rpicam was provided.
+	ErrProfileKindGo264WithRPICam = errors.New("config: profile.rpicam must be omitted when kind is \"go264\"")
+	// ErrProfileGo264Required means profile.kind=="go264" but profile.go264 was not provided.
+	ErrProfileGo264Required = errors.New("config: profile.go264 is required when kind is \"go264\"")
+	// ErrProfileGo264FieldRange means a Go264 source parameter is out of its accepted range.
+	ErrProfileGo264FieldRange = errors.New("config: profile.go264 parameter is out of range")
+	// ErrProfileGo264FieldEven means a Go264 width or height is odd, which
+	// 4:2:0 chroma subsampling cannot represent.
+	ErrProfileGo264FieldEven = errors.New("config: profile.go264 width and height must be even")
+	// ErrProfileGo264ModeInvalid means profile.go264.mode is neither "live"
+	// nor "loop".
+	ErrProfileGo264ModeInvalid = errors.New("config: profile.go264.mode must be \"live\" or \"loop\"")
 
 	// ErrAuthUsersRequired means auth.enabled=true but auth.users is empty.
 	ErrAuthUsersRequired = errors.New("config: auth.users must contain at least one user when auth.enabled is true")
@@ -718,9 +796,74 @@ func validateProfileSource(prefix string, p *ProfileConfig) error {
 			return fmt.Errorf("config: %s: %w", prefix, ErrProfileRPICamRequired)
 		}
 		return validateRPICam(prefix+".rpicam", p.RPICam)
+	case ProfileKindGo264:
+		if p.MediaFilePath != "" {
+			return fmt.Errorf("config: %s: %w", prefix, ErrProfileKindGo264WithFile)
+		}
+		if p.RPICam != nil {
+			return fmt.Errorf("config: %s: %w", prefix, ErrProfileKindGo264WithRPICam)
+		}
+		if p.Go264 == nil {
+			return fmt.Errorf("config: %s: %w", prefix, ErrProfileGo264Required)
+		}
+		return validateGo264(prefix+".go264", p.Go264)
 	default:
 		return fmt.Errorf("config: %s.kind %q: %w", prefix, p.Kind, ErrProfileKindInvalid)
 	}
+}
+
+// validateGo264 range-checks the pure-Go synthetic source parameters. Zero
+// values are valid (the runtime applies built-in defaults), so only
+// out-of-range non-zero values are rejected.
+func validateGo264(prefix string, g *Go264Config) error {
+	if err := validateGo264Geometry(prefix, g); err != nil {
+		return err
+	}
+	if err := validateGo264Rate(prefix, g); err != nil {
+		return err
+	}
+	if g.GOPSize < 0 {
+		return fmt.Errorf("config: %s.gop_size: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	switch g.Mode {
+	case "", Go264ModeLive, Go264ModeLoop:
+	default:
+		return fmt.Errorf("config: %s.mode: %w", prefix, ErrProfileGo264ModeInvalid)
+	}
+	// Upper bound keeps the warm-up cache bounded (300 s at 30 fps is 9000
+	// access units) so a typo cannot turn a test instance into an OOM.
+	if g.LoopSeconds < 0 || g.LoopSeconds > maxGo264LoopSeconds {
+		return fmt.Errorf("config: %s.loop_seconds: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	return nil
+}
+
+// validateGo264Geometry range-checks width and height. Zero is valid (the
+// runtime applies built-in defaults), so only out-of-range non-zero values are
+// rejected. 4:2:0 chroma requires even dimensions and go264.NewEncoder rejects
+// odd values, so fail at config load instead of at startup.
+func validateGo264Geometry(prefix string, g *Go264Config) error {
+	if g.Width != 0 && (g.Width < go264MinDimension || g.Width > go264MaxDimension) {
+		return fmt.Errorf("config: %s.width: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	if g.Height != 0 && (g.Height < go264MinDimension || g.Height > go264MaxDimension) {
+		return fmt.Errorf("config: %s.height: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	if g.Width%2 != 0 || g.Height%2 != 0 {
+		return fmt.Errorf("config: %s: %w", prefix, ErrProfileGo264FieldEven)
+	}
+	return nil
+}
+
+// validateGo264Rate range-checks the frame rate and quantizer.
+func validateGo264Rate(prefix string, g *Go264Config) error {
+	if g.FPS != 0 && (g.FPS < go264MinFPS || g.FPS > go264MaxFPS) {
+		return fmt.Errorf("config: %s.fps: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	if g.QP != 0 && (g.QP < go264MinQP || g.QP > go264MaxQP) {
+		return fmt.Errorf("config: %s.qp: %w", prefix, ErrProfileGo264FieldRange)
+	}
+	return nil
 }
 
 // validateRPICam range-checks the rpicam capture parameters. Bounds match
@@ -1205,6 +1348,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("config: read %s: %w", filepath.Base(p), err)
 	}
+	// Windows editors (Notepad, PowerShell 5.1 Set-Content -Encoding UTF8)
+	// prepend a UTF-8 BOM, which encoding/json rejects with a confusing
+	// "invalid character '\ufeff'" error. Strip it before parsing.
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
 		return Config{}, fmt.Errorf("config: parse %s: %w", filepath.Base(p), err)

@@ -31,12 +31,11 @@ jobs:
         working-directory: internal/gui/frontend
         run: npm run build
 
+      # `just coverage` prints a per-function coverage table, which is all this
+      # repository needs. There is deliberately no Codecov upload step: it needs
+      # a per-repository token, its tokenless policy changes out from under
+      # forks, and codecov.yml ignores cmd/** — the part of the tree this fork
+      # actually changes. codecov.yml itself is kept so the thresholds stay
+      # documented if the upload is ever wired back up.
       - name: Run tests with coverage
         run: just coverage
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage.out
-          fail_ci_if_error: true

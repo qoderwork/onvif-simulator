@@ -32,8 +32,8 @@ func MJPEGSiblingParentToken(token string) string {
 }
 
 // deriveMJPEGSiblings produces one in-memory MJPEG sibling per user
-// profile with a usable source. The siblings copy width/height/fps from
-// the (already-probed) parent so clients see consistent dimensions
+// profile that can actually feed one. The siblings copy width/height/fps
+// from the (already-probed) parent so clients see consistent dimensions
 // across both codecs; encoding is fixed at "MJPEG" so the media provider
 // can pick the JPEG branch when answering GetVideoEncoderConfiguration.
 // The returned slice is independent of the input — callers may mutate.
@@ -41,7 +41,7 @@ func deriveMJPEGSiblings(profiles []config.ProfileConfig) []config.ProfileConfig
 	out := make([]config.ProfileConfig, 0, len(profiles))
 	for i := range profiles {
 		src := profiles[i]
-		if !src.HasSource() {
+		if !canServeMJPEGSibling(&src) {
 			continue
 		}
 		// Skip if the source itself is already an MJPEG sibling — defensive
@@ -77,6 +77,26 @@ func deriveMJPEGSiblings(profiles []config.ProfileConfig) []config.ProfileConfig
 		out = append(out, sibling)
 	}
 	return out
+}
+
+// canServeMJPEGSibling reports whether a JPEG sibling can actually be fed for
+// this profile. The sibling is a transcoded JPEG stream, so it needs a real
+// media source: kind=file needs an on-disk mp4 for the ffmpeg transcoder and
+// kind=rpicam needs the Pi camera config. Profiles that fall back to the
+// embedded sample clip (empty media_file_path) and kind=go264 profiles have
+// no file to transcode, so they get no sibling. Note the H.264 main stream
+// itself never needs ffmpeg — it is demuxed in pure Go (pmp4); the ffmpeg
+// helper is only required for the JPEG transcode. This is narrower than
+// ProfileConfig.HasSource, which also accepts the embedded-sample fallback.
+func canServeMJPEGSibling(p *config.ProfileConfig) bool {
+	switch p.Kind {
+	case "", config.ProfileKindFile:
+		return strings.TrimSpace(p.MediaFilePath) != ""
+	case config.ProfileKindRPICam:
+		return p.RPICam != nil
+	default:
+		return false
+	}
 }
 
 // hasProfileMatching reports whether profiles already contains an entry with

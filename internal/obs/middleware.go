@@ -115,7 +115,7 @@ func RequestMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
 			}
 			scoped.LogAttrs(ctx, level, "soap_request",
 				slog.Int("status", rec.status),
-				slog.String("soap_action", r.Header.Get("SOAPAction")),
+				slog.String("soap_action", r.Header.Get("SoapAction")),
 				slog.Duration("duration", dur),
 			)
 		}()

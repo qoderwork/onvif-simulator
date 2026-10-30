@@ -4,19 +4,34 @@ package main
 
 import (
 	"errors"
+	"os"
+	"os/signal"
 	"syscall"
 	"testing"
 	"time"
 )
 
 func TestRunServeSignalShutdown(t *testing.T) {
-	cfgPath, cleanup := writeTempConfig(t)
+	// Both listeners must be on reserved ephemeral ports: `go test` runs
+	// packages in parallel, and the shared fixture's RTSP default (8554) is
+	// also bound by internal/simulator tests.
+	cfgPath, cleanup := writeTempConfigWithPorts(t, freePort(t), freePort(t))
 	defer cleanup()
 
 	// Use a temp HOME/USERPROFILE so writeControlPortFile lands somewhere ephemeral.
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("USERPROFILE", tmpHome) // os.UserHomeDir uses USERPROFILE on Windows
+
+	// This test signals its own pid. Register a handler BEFORE runServe starts:
+	// without one, SIGINT arriving before runServe installs its own handler hits
+	// Go's default behavior and kills the whole test binary (`go test` then
+	// reports "signal: interrupt"). Having a handler registered means the signal
+	// is trapped for the lifetime of the test; runServe's own Notify is
+	// delivered alongside this one.
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGINT)
+	defer signal.Stop(guard)
 
 	done := make(chan error, 1)
 	go func() {
@@ -25,18 +40,26 @@ func TestRunServeSignalShutdown(t *testing.T) {
 
 	// Give the server a moment to bind.
 	time.Sleep(300 * time.Millisecond)
-	if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
-		t.Fatalf("kill: %v", err)
-	}
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("runServe returned: %v", err)
+	// runServe registers its handler some way into startup, so one signal can
+	// still arrive too early. Re-send until it answers: harmless, because the
+	// guard keeps the signal trapped instead of fatal. This removes the
+	// dependence on how long startup takes on the current machine.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
+			t.Fatalf("kill: %v", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("runServe did not exit on SIGINT")
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("runServe returned: %v", err)
+			}
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
+	t.Fatal("runServe did not exit on SIGINT")
 }
 
 func TestRunTUIReturnsTUIError(t *testing.T) {

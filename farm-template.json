@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "device": {
+    "uuid": "urn:uuid:00000000-0000-4000-8000-0000000000aa",
+    "manufacturer": "ONVIF Simulator",
+    "model": "SimCam-100",
+    "serial": "SN-TMPL",
+    "firmware": "0.1.0",
+    "scopes": [
+      "onvif://www.onvif.org/Profile/Streaming",
+      "onvif://www.onvif.org/name/simulator",
+      "onvif://www.onvif.org/hardware/virtual"
+    ]
+  },
+  "network": {
+    "http_port": 18080,
+    "rtsp_port": 18554
+  },
+  "media": {
+    "profiles": [
+      {
+        "name": "main",
+        "token": "profile_main",
+        "kind": "go264",
+        "go264": {
+          "width": 640,
+          "height": 360,
+          "fps": 15,
+          "qp": 30,
+          "gop_size": 15,
+          "mode": "loop",
+          "loop_seconds": 3
+        },
+        "video_source_token": "VS_MAIN"
+      }
+    ]
+  },
+  "auth": {
+    "enabled": true,
+    "users": [
+      {
+        "username": "admin",
+        "password": "admin",
+        "role": "Administrator"
+      }
+    ],
+    "digest": {
+      "realm": "onvif-simulator",
+      "algorithms": ["MD5"],
+      "nonce_ttl": "5m"
+    },
+    "jwt": {
+      "enabled": false,
+      "algorithms": ["RS256"],
+      "username_claim": "sub",
+      "roles_claim": "roles",
+      "clock_skew": "30s"
+    }
+  },
+  "runtime": {
+    "discovery_mode": "NonDiscoverable",
+    "hostname": "onvif-simulator",
+    "dns": {
+      "from_dhcp": false,
+      "search_domain": ["local"],
+      "dns_manual": ["8.8.8.8", "8.8.4.4"]
+    },
+    "default_gateway": {
+      "ipv4_address": ["192.168.1.1"]
+    },
+    "network_protocols": [
+      {"name": "HTTP",  "enabled": true,  "port": [18080]},
+      {"name": "RTSP",  "enabled": true,  "port": [18554]},
+      {"name": "HTTPS", "enabled": false, "port": [443]}
+    ],
+    "system_date_and_time": {
+      "date_time_type": "NTP",
+      "daylight_savings": false,
+      "tz": "UTC"
+    }
+  },
+  "events": {
+    "max_pull_points": 10,
+    "subscription_timeout": "1h",
+    "topics": [
+      {"name": "tns1:VideoSource/MotionAlarm",     "enabled": true},
+      {"name": "tns1:VideoSource/ImageTooBlurry",  "enabled": true},
+      {"name": "tns1:VideoSource/ImageTooDark",    "enabled": true},
+      {"name": "tns1:VideoSource/ImageTooBright",  "enabled": true},
+      {"name": "tns1:Device/Trigger/DigitalInput", "enabled": true}
+    ]
+  },
+  "logging": {
+    "level": "info",
+    "file": ""
+  }
+}

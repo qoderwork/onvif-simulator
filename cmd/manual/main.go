@@ -88,7 +88,11 @@ func run() int {
 			if killErr := srv.Process.Kill(); killErr != nil {
 				logger.Warn("kill pkgsite", "err", killErr)
 			}
-			<-exitCh
+			// Wait for the child to actually exit so its output is flushed
+			// before we return; the status itself is already being reported.
+			if exitErr := <-exitCh; exitErr != nil {
+				logger.Info("pkgsite stopped", "err", exitErr)
+			}
 			return 1
 		}
 		fmt.Printf("opening %s\n", url)

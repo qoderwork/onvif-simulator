@@ -7,6 +7,13 @@ jobs:
   coverage:
     name: Test & Coverage
     runs-on: ubuntu-latest
+    env:
+      # Exposed through env so the upload step can test for it: the secrets
+      # context is not available in step-level if conditions. Forks have no
+      # CODECOV_TOKEN, and Codecov rejects tokenless uploads for a repository
+      # it has never been activated for, so the step is skipped there instead
+      # of failing the build.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v6.0.2
 
@@ -34,9 +41,12 @@ jobs:
       - name: Run tests with coverage
         run: just coverage
 
+      # fail_ci_if_error stays true so that a configured token which fails to
+      # upload still breaks the build; only the "no token at all" case is skipped.
       - name: Upload coverage to Codecov
+        if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
           files: coverage.out
           fail_ci_if_error: true
